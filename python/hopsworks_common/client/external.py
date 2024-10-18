@@ -190,6 +190,7 @@ class Client(base.Client):
         with open(self._cert_key_path, "w") as f:
             f.write(str(credentials["password"]))
 
+        os.environ['HOPSWORKS_CERT_DIR'] = self._cert_folder
         # Return the credentials object for the Python engine to materialize the pem files.
         return credentials
 

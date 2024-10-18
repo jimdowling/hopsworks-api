@@ -49,7 +49,7 @@ class Client(base.Client):
         self._base_url = self._get_hopsworks_rest_endpoint()
         self._host, self._port = self._get_host_port_pair()
         self._secrets_dir = (
-            os.environ[self.SECRETS_DIR] if self.SECRETS_DIR in os.environ else ""
+            os.environ[self.SECRETS_DIR] if self.SECRETS_DIR in os.environ else "/tmp"
         )
         self._cert_key = self._get_cert_pw()
 
@@ -75,6 +75,7 @@ class Client(base.Client):
 
         self._write_pem_file(credentials["clientCert"], self._get_client_cert_path())
         self._write_pem_file(credentials["clientKey"], self._get_client_key_path())
+        os.environ["HOPSWORKS_CERT_DIR"]= self._secrets_dir
 
     def _materialize_ca_chain(self):
         """Convert truststore from jks to pem and return the location"""
@@ -95,13 +96,13 @@ class Client(base.Client):
         return os.environ[self.REST_ENDPOINT]
 
     def _get_ca_chain_path(self) -> str:
-        return os.path.join("/tmp", "ca_chain.pem")
+        return os.path.join(self._secrets_dir, "ca_chain.pem")
 
     def _get_client_cert_path(self) -> str:
-        return os.path.join("/tmp", "client_cert.pem")
+        return os.path.join(self._secrets_dir, "client_cert.pem")
 
     def _get_client_key_path(self) -> str:
-        return os.path.join("/tmp", "client_key.pem")
+        return os.path.join(self._secrets_dir, "client_key.pem")
 
     def _get_jks_trust_store_path(self):
         """
