@@ -132,7 +132,7 @@ Feature Store (Offline + Online if enabled)
 ## Usage Example
 
 ```typescript
-import { connection } from '@hopsworks/api';
+import { connection } from '@logicalclocks/hopsworks-api';
 
 const conn = await connection({
   host: 'my-instance.cloud.hopsworks.ai',

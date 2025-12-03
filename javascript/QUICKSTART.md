@@ -20,7 +20,7 @@ This guide will help you get started with the Hopsworks JavaScript API in just a
 ## Installation
 
 ```bash
-npm install @hopsworks/api
+npm install @logicalclocks/hopsworks-api
 ```
 
 ## Your First Feature Group
@@ -30,7 +30,7 @@ npm install @hopsworks/api
 Create a new file `example.ts`:
 
 ```typescript
-import { connection } from '@hopsworks/api';
+import { connection } from '@logicalclocks/hopsworks-api';
 
 async function main() {
   // Connect to Hopsworks
@@ -49,7 +49,7 @@ main().catch(console.error);
 ### Step 2: Access Your Feature Store
 
 ```typescript
-import { connection } from '@hopsworks/api';
+import { connection } from '@logicalclocks/hopsworks-api';
 
 async function main() {
   const conn = await connection({
@@ -73,7 +73,7 @@ main().catch(console.error);
 ### Step 3: Create a Feature Group
 
 ```typescript
-import { connection } from '@hopsworks/api';
+import { connection } from '@logicalclocks/hopsworks-api';
 
 async function main() {
   const conn = await connection({
@@ -103,7 +103,7 @@ main().catch(console.error);
 ### Step 4: Insert Data
 
 ```typescript
-import { connection } from '@hopsworks/api';
+import { connection } from '@logicalclocks/hopsworks-api';
 
 async function main() {
   const conn = await connection({
@@ -150,7 +150,7 @@ main().catch(console.error);
 For better security, use environment variables for your credentials:
 
 ```typescript
-import { connection } from '@hopsworks/api';
+import { connection } from '@logicalclocks/hopsworks-api';
 
 async function main() {
   const conn = await connection({
@@ -179,7 +179,7 @@ npm install dotenv
 
 ```typescript
 import 'dotenv/config';
-import { connection } from '@hopsworks/api';
+import { connection } from '@logicalclocks/hopsworks-api';
 // ... rest of your code
 ```
 
@@ -188,7 +188,7 @@ import { connection } from '@hopsworks/api';
 Here's a complete working example that demonstrates all the basic features:
 
 ```typescript
-import { connection } from '@hopsworks/api';
+import { connection } from '@logicalclocks/hopsworks-api';
 
 async function main() {
   console.log('🚀 Starting Hopsworks example...\n');

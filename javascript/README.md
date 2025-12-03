@@ -15,13 +15,13 @@ This is a limited initial version of the JavaScript API that provides:
 ## Installation
 
 ```bash
-npm install @hopsworks/api
+npm install @logicalclocks/hopsworks-api
 ```
 
 ## Quick Start
 
 ```typescript
-import { connection } from '@hopsworks/api';
+import { connection } from '@logicalclocks/hopsworks-api';
 
 // Connect to Hopsworks
 const conn = await connection({
@@ -58,7 +58,7 @@ await fg.insert(data);
 Create a connection to Hopsworks:
 
 ```typescript
-import { connection } from '@hopsworks/api';
+import { connection } from '@logicalclocks/hopsworks-api';
 
 const conn = await connection({
   host: 'my-instance.cloud.hopsworks.ai',

@@ -1,5 +1,5 @@
 {
-  "name": "@hopsworks/api",
+  "name": "@logicalclocks/hopsworks-api",
   "version": "0.1.0",
   "description": "JavaScript client library for Hopsworks Feature Store",
   "main": "dist/index.js",
@@ -17,7 +17,7 @@
     "machine-learning",
     "mlops"
   ],
-  "author": "Hopsworks AB",
+  "author": "Jim Dowling",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

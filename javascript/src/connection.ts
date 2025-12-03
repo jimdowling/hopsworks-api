@@ -33,7 +33,7 @@ export interface ConnectionOptions {
  *
  * @example
  * ```typescript
- * import { connection } from '@hopsworks/api';
+ * import { connection } from '@logicalclocks/hopsworks-api';
  *
  * const conn = await connection({
  *   host: 'my-instance.cloud.hopsworks.ai',
@@ -148,7 +148,7 @@ export class Connection {
  *
  * @example
  * ```typescript
- * import { connection } from '@hopsworks/api';
+ * import { connection } from '@logicalclocks/hopsworks-api';
  *
  * const conn = await connection({
  *   host: 'my-instance.cloud.hopsworks.ai',
