@@ -1405,10 +1405,9 @@ class TestFeatureGroupEngine:
         assert f.partition is False
         assert f.hudi_precombine_key is False
         assert mock_print.call_count == 1
-        assert mock_print.call_args[0][
-            0
-        ] == "Feature Group created successfully, explore it at \n{}".format(
-            feature_group_url
+        assert (
+            mock_print.call_args[0][0]
+            == f"Feature Group created successfully, explore it at \n{feature_group_url}"
         )
         mock_save_empty_table.assert_not_called()
 
@@ -1459,10 +1458,9 @@ class TestFeatureGroupEngine:
         assert f.partition is False
         assert f.hudi_precombine_key is False
         assert mock_print.call_count == 1
-        assert mock_print.call_args[0][
-            0
-        ] == "Feature Group created successfully, explore it at \n{}".format(
-            feature_group_url
+        assert (
+            mock_print.call_args[0][0]
+            == f"Feature Group created successfully, explore it at \n{feature_group_url}"
         )
         mock_save_empty_table.assert_called_once_with(fg, write_options=None)
 
@@ -1513,10 +1511,9 @@ class TestFeatureGroupEngine:
         assert f.partition is True
         assert f.hudi_precombine_key is True
         assert mock_print.call_count == 1
-        assert mock_print.call_args[0][
-            0
-        ] == "Feature Group created successfully, explore it at \n{}".format(
-            feature_group_url
+        assert (
+            mock_print.call_args[0][0]
+            == f"Feature Group created successfully, explore it at \n{feature_group_url}"
         )
         mock_save_empty_table.assert_not_called()
 
@@ -1675,10 +1672,9 @@ class TestFeatureGroupEngine:
         # Assert
         assert mock_fg_api.return_value.save.call_count == 1
         assert mock_print.call_count == 1
-        assert mock_print.call_args[0][
-            0
-        ] == "Feature Group created successfully, explore it at \n{}".format(
-            feature_group_url
+        assert (
+            mock_print.call_args[0][0]
+            == f"Feature Group created successfully, explore it at \n{feature_group_url}"
         )
         mock_save_empty_table.assert_not_called()
 
@@ -1730,10 +1726,9 @@ class TestFeatureGroupEngine:
         assert f.partition is False
         assert f.hudi_precombine_key is False
         assert mock_print.call_count == 1
-        assert mock_print.call_args[0][
-            0
-        ] == "Feature Group created successfully, explore it at \n{}".format(
-            feature_group_url
+        assert (
+            mock_print.call_args[0][0]
+            == f"Feature Group created successfully, explore it at \n{feature_group_url}"
         )
         mock_save_empty_table.assert_not_called()
 
@@ -1821,3 +1816,252 @@ class TestFeatureGroupEngine:
         assert len(result) == 2
         assert result[0].name == "col1"
         assert result[1].name == "test"
+
+    def test_delete_kafka_topics_internal_kafka_deletes_topics(self, mocker):
+        # Arrange
+        feature_store_id = 99
+        fg_engine = feature_group_engine.FeatureGroupEngine(
+            feature_store_id=feature_store_id
+        )
+
+        mock_client = mocker.patch("hopsworks_common.client.get_instance")
+        mock_client.return_value._is_external.return_value = False
+
+        mock_fs = mocker.Mock()
+        mock_fs.project_name = "myproject"
+
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=feature_store_id,
+            primary_key=[],
+            topic_name="my_topic_onlinefs",
+            online_topic_name="my_topic_onlinefs",
+        )
+        fg.feature_store = mock_fs
+
+        mock_delete_topic = mocker.patch.object(fg_engine._kafka_api, "_delete_topic")
+        mock_warn = mocker.patch("warnings.warn")
+
+        # Act
+        fg_engine._delete_kafka_topics(fg)
+
+        # Assert - Should delete topic once (deduplicated)
+        mock_delete_topic.assert_called_once_with("my_topic_onlinefs")
+        assert mock_warn.call_count == 1
+        assert "Deleted Kafka topic" in str(mock_warn.call_args)
+
+    def test_delete_kafka_topics_external_client_internal_kafka_deletes(self, mocker):
+        # Arrange
+        feature_store_id = 99
+        fg_engine = feature_group_engine.FeatureGroupEngine(
+            feature_store_id=feature_store_id
+        )
+
+        mock_fs = mocker.Mock()
+        mock_fs.project_name = "myproject"
+
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=feature_store_id,
+            primary_key=[],
+            topic_name="my_topic_onlinefs",
+        )
+        fg.feature_store = mock_fs
+
+        mock_delete_topic = mocker.patch.object(fg_engine._kafka_api, "_delete_topic")
+
+        # Act
+        fg_engine._delete_kafka_topics(fg)
+
+        # Assert - Should delete topics even for external client if using internal Kafka
+        mock_delete_topic.assert_called_once_with("my_topic_onlinefs")
+
+    def test_delete_kafka_topics_external_kafka_connector_does_not_delete(self, mocker):
+        # Arrange
+        feature_store_id = 99
+        fg_engine = feature_group_engine.FeatureGroupEngine(
+            feature_store_id=feature_store_id
+        )
+
+        mock_client = mocker.patch("hopsworks_common.client.get_instance")
+        mock_client.return_value._is_external.return_value = False
+
+        # Create a mock external Kafka connector
+        from hsfs.storage_connector import KafkaConnector
+
+        mock_kafka_connector = mocker.Mock(spec=KafkaConnector)
+        mock_kafka_connector._external_kafka = True
+
+        mock_fs = mocker.Mock()
+        mock_fs.project_name = "myproject"
+
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=feature_store_id,
+            primary_key=[],
+            topic_name="my_topic_onlinefs",
+            storage_connector=mock_kafka_connector,
+        )
+        fg.feature_store = mock_fs
+
+        mock_delete_topic = mocker.patch.object(fg_engine._kafka_api, "_delete_topic")
+
+        # Act
+        fg_engine._delete_kafka_topics(fg)
+
+        # Assert - Should not delete topics for external Kafka cluster
+        mock_delete_topic.assert_not_called()
+
+    def test_delete_kafka_topics_does_not_delete_project_topic(self, mocker):
+        # Arrange
+        feature_store_id = 99
+        fg_engine = feature_group_engine.FeatureGroupEngine(
+            feature_store_id=feature_store_id
+        )
+
+        mock_client = mocker.patch("hopsworks_common.client.get_instance")
+        mock_client.return_value._is_external.return_value = False
+
+        mock_fs = mocker.Mock()
+        mock_fs.project_name = "myproject"
+
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=feature_store_id,
+            primary_key=[],
+            topic_name="myproject_onlinefs",
+            online_topic_name="myproject_onlinefs",
+        )
+        fg.feature_store = mock_fs
+
+        mock_delete_topic = mocker.patch.object(fg_engine._kafka_api, "_delete_topic")
+
+        # Act
+        fg_engine._delete_kafka_topics(fg)
+
+        # Assert - Should not delete project topic
+        mock_delete_topic.assert_not_called()
+
+    def test_delete_kafka_topics_handles_deletion_failure(self, mocker):
+        # Arrange
+        feature_store_id = 99
+        fg_engine = feature_group_engine.FeatureGroupEngine(
+            feature_store_id=feature_store_id
+        )
+
+        mock_client = mocker.patch("hopsworks_common.client.get_instance")
+        mock_client.return_value._is_external.return_value = False
+
+        mock_fs = mocker.Mock()
+        mock_fs.project_name = "myproject"
+
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=feature_store_id,
+            primary_key=[],
+            topic_name="my_topic_onlinefs",
+        )
+        fg.feature_store = mock_fs
+
+        mock_delete_topic = mocker.patch.object(fg_engine._kafka_api, "_delete_topic")
+        mock_delete_topic.side_effect = Exception("Topic not found")
+        mock_warn = mocker.patch("warnings.warn")
+
+        # Act
+        fg_engine._delete_kafka_topics(fg)
+
+        # Assert - Should catch exception and warn
+        mock_delete_topic.assert_called_once()
+        assert mock_warn.call_count == 1
+        assert "Failed to delete Kafka topic" in str(mock_warn.call_args)
+
+    def test_delete_kafka_topics_deduplicates_same_topic(self, mocker):
+        # Arrange
+        feature_store_id = 99
+        fg_engine = feature_group_engine.FeatureGroupEngine(
+            feature_store_id=feature_store_id
+        )
+
+        mock_client = mocker.patch("hopsworks_common.client.get_instance")
+        mock_client.return_value._is_external.return_value = False
+
+        mock_fs = mocker.Mock()
+        mock_fs.project_name = "myproject"
+
+        # Both topic_name and online_topic_name point to same topic
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=feature_store_id,
+            primary_key=[],
+            topic_name="shared_topic_onlinefs",
+            online_topic_name="shared_topic_onlinefs",
+        )
+        fg.feature_store = mock_fs
+
+        mock_delete_topic = mocker.patch.object(fg_engine._kafka_api, "_delete_topic")
+
+        # Act
+        fg_engine._delete_kafka_topics(fg)
+
+        # Assert - Should only delete once (deduplicated via set)
+        mock_delete_topic.assert_called_once_with("shared_topic_onlinefs")
+
+    def test_delete_calls_kafka_topic_cleanup(self, mocker):
+        # Arrange
+        feature_store_id = 99
+        fg_engine = feature_group_engine.FeatureGroupEngine(
+            feature_store_id=feature_store_id
+        )
+
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=feature_store_id,
+            primary_key=[],
+        )
+
+        mock_delete_topics = mocker.patch.object(fg_engine, "_delete_kafka_topics")
+        mock_delete_api = mocker.patch.object(fg_engine._feature_group_api, "delete")
+
+        # Act
+        fg_engine.delete(fg)
+
+        # Assert
+        mock_delete_topics.assert_called_once_with(fg)
+        mock_delete_api.assert_called_once_with(fg)
+
+    def test_delete_continues_on_kafka_cleanup_failure(self, mocker):
+        # Arrange
+        feature_store_id = 99
+        fg_engine = feature_group_engine.FeatureGroupEngine(
+            feature_store_id=feature_store_id
+        )
+
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=feature_store_id,
+            primary_key=[],
+        )
+
+        mock_delete_topics = mocker.patch.object(fg_engine, "_delete_kafka_topics")
+        mock_delete_topics.side_effect = Exception("Kafka error")
+        mock_delete_api = mocker.patch.object(fg_engine._feature_group_api, "delete")
+        mock_warn = mocker.patch("warnings.warn")
+
+        # Act
+        fg_engine.delete(fg)
+
+        # Assert - Should continue with FG deletion despite Kafka error
+        mock_delete_topics.assert_called_once()
+        mock_delete_api.assert_called_once_with(fg)
+        assert any(
+            "Error during Kafka topic cleanup" in str(call)
+            for call in mock_warn.call_args_list
+        )

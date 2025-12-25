@@ -2272,6 +2272,15 @@ class FeatureGroupBase:
         self._notification_topic_name = notification_topic_name
 
     @property
+    def online_topic_name(self) -> str | None:
+        """The topic used for online feature store serving."""
+        return self._online_topic_name
+
+    @online_topic_name.setter
+    def online_topic_name(self, online_topic_name: str | None) -> None:
+        self._online_topic_name = online_topic_name
+
+    @property
     def deprecated(self) -> bool:
         """Setting if the feature group is deprecated."""
         return self._deprecated
@@ -3919,6 +3928,20 @@ class FeatureGroup(FeatureGroupBase):
             )
         return super().compute_statistics()
 
+    def _validate_online_topic_name(self) -> None:
+        """Validate that online_topic_name ends with '_onlinefs' suffix."""
+        if (
+            self._online_topic_name
+            and self._online_enabled
+            and not self._online_topic_name.endswith("_onlinefs")
+        ):
+            warnings.warn(
+                f"Online topic name '{self._online_topic_name}' does not end with '_onlinefs' suffix. "
+                f"This may indicate an issue with topic naming convention.",
+                util.StorageWarning,
+                stacklevel=2,
+            )
+
     @classmethod
     def from_response_json(
         cls, json_dict: dict[str, Any] | list[dict[str, Any]]
@@ -3989,6 +4012,7 @@ class FeatureGroup(FeatureGroupBase):
                 for transformation_function in transformation_functions
             ]
         self.__init__(**json_decamelized)
+        self._validate_online_topic_name()
         return self
 
     def json(self) -> str:

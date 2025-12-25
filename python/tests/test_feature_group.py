@@ -1477,3 +1477,118 @@ class TestExternalFeatureGroup:
         assert new_fg.features[0].name == "primarykey"
         assert new_fg.features[1].name == "event_time"
         assert new_fg.features[2].name == "feat"
+
+    def test_validate_online_topic_name_with_correct_suffix(self, mocker):
+        # Arrange
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=1,
+            primary_key=[],
+            online_enabled=True,
+            online_topic_name="test_topic_onlinefs",
+        )
+        mock_warn = mocker.patch("warnings.warn")
+
+        # Act
+        fg._validate_online_topic_name()
+
+        # Assert
+        mock_warn.assert_not_called()
+
+    def test_validate_online_topic_name_without_suffix_warns(self, mocker):
+        # Arrange
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=1,
+            primary_key=[],
+            online_enabled=True,
+            online_topic_name="test_topic",
+        )
+        mock_warn = mocker.patch("warnings.warn")
+
+        # Act
+        fg._validate_online_topic_name()
+
+        # Assert
+        mock_warn.assert_called_once()
+        assert "does not end with '_onlinefs' suffix" in str(mock_warn.call_args)
+
+    def test_validate_online_topic_name_when_online_disabled(self, mocker):
+        # Arrange
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=1,
+            primary_key=[],
+            online_enabled=False,
+            online_topic_name="test_topic",
+        )
+        mock_warn = mocker.patch("warnings.warn")
+
+        # Act
+        fg._validate_online_topic_name()
+
+        # Assert - Should not warn when online is disabled
+        mock_warn.assert_not_called()
+
+    def test_validate_online_topic_name_when_none(self, mocker):
+        # Arrange
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=1,
+            primary_key=[],
+            online_enabled=True,
+            online_topic_name=None,
+        )
+        mock_warn = mocker.patch("warnings.warn")
+
+        # Act
+        fg._validate_online_topic_name()
+
+        # Assert - Should not warn when topic_name is None
+        mock_warn.assert_not_called()
+
+    def test_update_from_response_json_calls_validation(self, mocker):
+        # Arrange
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=1,
+            primary_key=[],
+        )
+        mock_validate = mocker.patch.object(fg, "_validate_online_topic_name")
+
+        json_dict = {
+            "type": "cachedFeaturegroupDTO",
+            "name": "test",
+            "version": 1,
+            "featurestoreId": 1,
+            "onlineEnabled": True,
+            "onlineTopicName": "test_topic_onlinefs",
+        }
+
+        # Act
+        fg.update_from_response_json(json_dict)
+
+        # Assert
+        mock_validate.assert_called_once()
+
+    def test_online_topic_name_property(self):
+        # Arrange & Act
+        fg = feature_group.FeatureGroup(
+            name="test",
+            version=1,
+            featurestore_id=1,
+            primary_key=[],
+            online_topic_name="test_topic_onlinefs",
+        )
+
+        # Assert
+        assert fg.online_topic_name == "test_topic_onlinefs"
+
+        # Test setter
+        fg.online_topic_name = "new_topic_onlinefs"
+        assert fg.online_topic_name == "new_topic_onlinefs"

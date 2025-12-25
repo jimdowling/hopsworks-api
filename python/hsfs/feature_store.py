@@ -654,6 +654,29 @@ class FeatureStore:
         """
         if not data_source:
             data_source = ds.DataSource(path=path)
+
+        # Validate and modify topic_name if provided
+        if topic_name:
+            # R3: Prevent collision with project topic
+            project_topic = f"{self._project_name}_onlinefs"
+            if topic_name == project_topic:
+                raise ValueError(
+                    f"Cannot use topic name '{topic_name}'. "
+                    f"This is the default project topic reserved for feature groups without dedicated topics. "
+                    f"Please choose a different topic name."
+                )
+
+            # R1: Ensure topic name ends with "_onlinefs"
+            if not topic_name.endswith("_onlinefs"):
+                original_topic_name = topic_name
+                topic_name = f"{topic_name}_onlinefs"
+                warnings.warn(
+                    f"Appended '_onlinefs' suffix to topic name: '{original_topic_name}' -> '{topic_name}'. "
+                    f"This ensures the topic is synchronized with the online feature store.",
+                    util.StorageWarning,
+                    stacklevel=2,
+                )
+
         feature_group_object = feature_group.FeatureGroup(
             name=name,
             version=version,

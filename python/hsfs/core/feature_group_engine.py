@@ -255,7 +255,86 @@ class FeatureGroupEngine(feature_group_base_engine.FeatureGroupBaseEngine):
             ge_report,
         )
 
+    def _delete_kafka_topics(self, feature_group):
+        """Delete Kafka topics associated with the feature group.
+
+        Only deletes topics if:
+        - Using internal Hopsworks Kafka (not external Kafka cluster)
+        - Topic exists and is not the project's default topic
+
+        Note: topic_name and online_topic_name may refer to the same physical topic,
+        so we deduplicate to avoid attempting to delete the same topic twice.
+        """
+        # Check if feature group uses external Kafka storage connector
+        # External Kafka topics are managed externally and should not be deleted
+        try:
+            # For feature groups with external Kafka, storage_connector would be set
+            if (
+                hasattr(feature_group, "storage_connector")
+                and feature_group.storage_connector is not None
+            ):
+                from hsfs.storage_connector import KafkaConnector
+
+                if isinstance(feature_group.storage_connector, KafkaConnector) and (
+                    hasattr(feature_group.storage_connector, "_external_kafka")
+                    and feature_group.storage_connector._external_kafka
+                ):
+                    # External Kafka cluster - don't delete topics
+                    return
+        except Exception:
+            # If we can't determine, err on the side of caution and don't delete
+            return
+
+        # Get project name to build exclusion pattern
+        project_name = feature_group.feature_store.project_name
+        project_topic = f"{project_name}_onlinefs"
+
+        topics_to_delete = set()  # Use set to avoid duplicates
+
+        # Check topic_name (user-provided for streaming ingestion)
+        if feature_group.topic_name and feature_group.topic_name != project_topic:
+            topics_to_delete.add(feature_group.topic_name)
+
+        # Check online_topic_name (backend-generated for online serving)
+        # May be the same as topic_name, but set will deduplicate
+        if (
+            hasattr(feature_group, "online_topic_name")
+            and feature_group.online_topic_name
+            and feature_group.online_topic_name != project_topic
+        ):
+            topics_to_delete.add(feature_group.online_topic_name)
+
+        # Delete topics via Kafka API
+        for topic_name in topics_to_delete:
+            try:
+                self._kafka_api._delete_topic(topic_name)
+                warnings.warn(
+                    f"Deleted Kafka topic '{topic_name}' associated with feature group.",
+                    util.JobWarning,
+                    stacklevel=3,
+                )
+            except Exception as e:
+                # Log error but don't fail the entire deletion
+                warnings.warn(
+                    f"Failed to delete Kafka topic '{topic_name}': {str(e)}. "
+                    f"You may need to delete it manually.",
+                    util.JobWarning,
+                    stacklevel=3,
+                )
+
     def delete(self, feature_group):
+        # R2: Delete Kafka topics first (before metadata deletion)
+        # If metadata deletion fails, topics still exist for recovery
+        try:
+            self._delete_kafka_topics(feature_group)
+        except Exception as e:
+            warnings.warn(
+                f"Error during Kafka topic cleanup: {str(e)}. Proceeding with feature group deletion.",
+                util.JobWarning,
+                stacklevel=2,
+            )
+
+        # Delete feature group metadata
         self._feature_group_api.delete(feature_group)
 
     def commit_details(self, feature_group, wallclock_time, limit):

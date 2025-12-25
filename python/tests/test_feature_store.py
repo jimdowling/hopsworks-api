@@ -206,3 +206,65 @@ class TestFeatureStore:
 
         # Assert
         assert fv_res is None
+
+    def test_create_feature_group_appends_onlinefs_suffix(
+        self, backend_fixtures, mocker
+    ):
+        # Arrange
+        mocker.patch("hopsworks_common.client.get_instance")
+        json = backend_fixtures["feature_store"]["get"]["response"]
+        fs = feature_store_mod.FeatureStore.from_response_json(json)
+        mock_warn = mocker.patch("warnings.warn")
+
+        # Act
+        fg = fs.create_feature_group(name="test", topic_name="my_topic")
+
+        # Assert
+        assert fg.topic_name == "my_topic_onlinefs"
+        mock_warn.assert_called_once()
+        assert "Appended '_onlinefs' suffix" in str(mock_warn.call_args)
+
+    def test_create_feature_group_keeps_existing_onlinefs_suffix(
+        self, backend_fixtures, mocker
+    ):
+        # Arrange
+        mocker.patch("hopsworks_common.client.get_instance")
+        json = backend_fixtures["feature_store"]["get"]["response"]
+        fs = feature_store_mod.FeatureStore.from_response_json(json)
+        mock_warn = mocker.patch("warnings.warn")
+
+        # Act
+        fg = fs.create_feature_group(name="test", topic_name="my_topic_onlinefs")
+
+        # Assert
+        assert fg.topic_name == "my_topic_onlinefs"
+        mock_warn.assert_not_called()
+
+    def test_create_feature_group_raises_error_for_project_topic_collision(
+        self, backend_fixtures, mocker
+    ):
+        # Arrange
+        mocker.patch("hopsworks_common.client.get_instance")
+        json = backend_fixtures["feature_store"]["get"]["response"]
+        fs = feature_store_mod.FeatureStore.from_response_json(json)
+
+        # Act & Assert
+        with mocker.patch.object(fs, "_project_name", "myproject"):
+            try:
+                fs.create_feature_group(name="test", topic_name="myproject_onlinefs")
+                raise AssertionError("Expected ValueError to be raised")
+            except ValueError as e:
+                assert "Cannot use topic name" in str(e)
+                assert "default project topic" in str(e)
+
+    def test_create_feature_group_without_topic_name(self, backend_fixtures, mocker):
+        # Arrange
+        mocker.patch("hopsworks_common.client.get_instance")
+        json = backend_fixtures["feature_store"]["get"]["response"]
+        fs = feature_store_mod.FeatureStore.from_response_json(json)
+
+        # Act
+        fg = fs.create_feature_group(name="test")
+
+        # Assert
+        assert fg.topic_name is None
