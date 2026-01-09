@@ -60,7 +60,7 @@ dependencies = [
 
 [project.scripts]
 hopsworks-mcp = "hopsworks.mcp.main:main"
-hopsworks-cli = "hopsworks_cli.main:main"
+hopsworks = "hopsworks_cli.main:main"
 
 [project.optional-dependencies]
 python = [
@@ -69,6 +69,9 @@ python = [
     "fastavro>=1.4.11,<=1.12.0",
     "tqdm",
     "hops-deltalake==1.1.2.post2; python_version >= '3.9' and (sys_platform == 'linux' or (sys_platform == 'darwin' and platform_machine == 'arm64'))",
+    "click>=8.0",
+    "rich>=13.0",
+    "pyyaml>=6.0",
 ]
 sqlalchemy-1 = [
     "pandas<2.2.0; python_version < '3.13'",
@@ -107,12 +110,6 @@ mcp=[
     "fastmcp>=2.10.5; python_version >= '3.10'",
     "httpx",
     "pydantic>=2.11.7",
-]
-cli=[
-    "click>=8.0",
-    "rich>=13.0",
-    "pyyaml>=6.0",
-    "pyarrow>=17.0",
 ]
 
 [dependency-groups]

@@ -198,3 +198,90 @@ def use_project(ctx, name, profile):
         if ctx.obj.get("verbose"):
             raise
         ctx.exit(1)
+
+
+@projects.command("switch")
+@click.argument("name")
+@click.option("--profile", help="Configuration profile to update (uses default if not specified)")
+@click.pass_context
+def switch_project(ctx, name, profile):
+    """
+    Switch to a different project
+
+    Validates project exists and user has access, then updates config.
+    This becomes the default project for future commands.
+
+    Example:
+        hopsworks projects switch my_project
+        hopsworks projects switch my_project --profile production
+    """
+    try:
+        # First authenticate (without a project)
+        get_connection(ctx, require_project=False)
+
+        # Verify the project exists and user has access
+        connection = client.get_connection()
+        try:
+            project = connection.get_project(name)
+        except Exception as e:
+            raise ResourceNotFoundError(
+                f"Project '{name}' not found or you don't have access. "
+                f"Run 'hopsworks projects list' to see available projects."
+            )
+
+        if not project:
+            raise ResourceNotFoundError(
+                f"Project '{name}' not found or you don't have access. "
+                f"Run 'hopsworks projects list' to see available projects."
+            )
+
+        # Load config
+        config = Config()
+        config.load()
+
+        # Determine which profile to update
+        profile_name = profile or ctx.obj.get("profile") or "default"
+
+        # Get or create the profile
+        try:
+            profile_obj = config.get_profile(profile_name)
+        except:
+            # Profile doesn't exist, create a new one
+            from hopsworks_cli.config import Profile
+            profile_obj = Profile(
+                host=ctx.obj.get("host"),
+                port=ctx.obj.get("port"),
+                project=name,
+                api_key_file=ctx.obj.get("api_key_file"),
+            )
+
+        # Update the project
+        profile_obj.project = name
+
+        # Save the updated profile
+        config.add_profile(profile_name, **vars(profile_obj))
+        config.set_default_profile(profile_name)
+        config.save()
+
+        print_success(f"Switched to project '{name}' (profile: {profile_name})")
+
+        # Show updated profile
+        profile_data = {
+            "profile": profile_name,
+            "project": name,
+            "host": profile_obj.host,
+            "port": profile_obj.port,
+        }
+
+        formatter = OutputFormatter()
+        output = formatter.format(profile_data, ctx.obj["output_format"])
+        click.echo(output)
+
+    except ResourceNotFoundError as e:
+        print_error(str(e))
+        ctx.exit(1)
+    except Exception as e:
+        print_error(f"Failed to switch project: {e}")
+        if ctx.obj.get("verbose"):
+            raise
+        ctx.exit(1)

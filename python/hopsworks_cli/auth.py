@@ -95,3 +95,27 @@ def get_feature_store(ctx, name: Optional[str] = None):
     """
     connection = get_connection(ctx)
     return connection.get_feature_store(name=name)
+
+
+def validate_api_key(host: str, port: int, api_key: str) -> bool:
+    """
+    Validate API key by making test request
+
+    # Arguments
+        host: Hopsworks hostname
+        port: Hopsworks port
+        api_key: API key to validate
+
+    # Returns
+        True if valid, False otherwise
+    """
+    try:
+        connection = hopsworks.login(
+            host=host,
+            port=port,
+            api_key_value=api_key,
+            hostname_verification=False
+        )
+        return True
+    except Exception:
+        return False

@@ -9,6 +9,8 @@ from hopsworks_cli.commands.models import models
 from hopsworks_cli.commands.deployments import deployments
 from hopsworks_cli.commands.jobs import jobs
 from hopsworks_cli.commands.secrets import secrets
+from hopsworks_cli.commands.setup import setup
+from hopsworks_cli.commands.users import users
 from hopsworks_cli.output import print_error
 from hopsworks_common.client.exceptions import RestAPIError
 
@@ -28,7 +30,7 @@ def handle_exception(ctx, exception):
 
 
 @click.group()
-@click.version_option(version="0.1.0", prog_name="hopsworks-cli")
+@click.version_option(version="0.1.0", prog_name="hopsworks")
 @click.option(
     "--host",
     envvar="HOPSWORKS_HOST",
@@ -156,11 +158,34 @@ def cli(
     host = host or DEFAULT_HOST
     port = port or 443
 
+    # Skip authentication check for setup command
+    if ctx.invoked_subcommand == "setup":
+        ctx.obj["config"] = config
+        ctx.obj["host"] = host
+        ctx.obj["port"] = port
+        ctx.obj["output_format"] = output_format
+        ctx.obj["verbose"] = verbose
+        return
+
+    # Try to auto-load from default profile if no auth provided
+    if not api_key and not api_key_file and not profile:
+        try:
+            default_profile = config.get_profile("default")
+            api_key_file = api_key_file or default_profile.api_key_file
+            # Also load other settings from default profile if not specified
+            host = host or default_profile.host
+            port = port or default_profile.port
+            project = project or default_profile.project
+        except:
+            # No default profile exists, which is fine
+            pass
+
     # Validate required authentication
     if not api_key and not api_key_file:
         print_error(
-            "Authentication required: provide --api-key-file or --api-key\n"
-            "You can also set HOPSWORKS_API_KEY or HOPSWORKS_API_KEY_FILE environment variables"
+            "Authentication required. Please run:\n"
+            "  hopsworks setup\n\n"
+            "Or provide --api-key-file or --api-key"
         )
         sys.exit(1)
 
@@ -179,7 +204,28 @@ def cli(
     ctx.obj["error_handler"] = handle_exception
 
 
+# Top-level project command as shortcut to projects switch
+@click.command()
+@click.argument("name")
+@click.option("--profile", help="Configuration profile to update")
+@click.pass_context
+def project(ctx, name, profile):
+    """
+    Switch to a different project (shortcut for 'projects switch')
+
+    Example:
+        hopsworks project my_project
+        hopsworks project my_project --profile production
+    """
+    # Delegate to projects.switch_project
+    from hopsworks_cli.commands.projects import switch_project
+    ctx.invoke(switch_project, name=name, profile=profile)
+
+
 # Register command groups
+cli.add_command(setup)
+cli.add_command(project)
+cli.add_command(users)
 cli.add_command(projects)
 cli.add_command(feature_groups)
 cli.add_command(models)

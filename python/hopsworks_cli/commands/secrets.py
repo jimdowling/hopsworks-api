@@ -1,4 +1,4 @@
-"""Secrets management commands"""
+"""Account-level secrets management commands"""
 
 import click
 import hopsworks
@@ -10,16 +10,21 @@ from hopsworks_cli.utils.exceptions import ResourceNotFoundError
 
 @click.group()
 def secrets():
-    """Manage secrets in the project"""
+    """Manage account-level secrets"""
     pass
 
 
 @secrets.command("list")
 @click.pass_context
 def list_secrets(ctx):
-    """List all secrets (does not show values)"""
+    """
+    List all account-level secrets (does not show values)
+
+    Example:
+        hopsworks secret list
+    """
     try:
-        get_connection(ctx)
+        get_connection(ctx, require_project=False)
         secrets_api = hopsworks.get_secrets_api()
         secrets_list = secrets_api.get_secrets()
 
@@ -27,14 +32,19 @@ def list_secrets(ctx):
             print("No secrets found")
             return
 
+        # Filter to account-level (PRIVATE visibility) secrets only
+        account_secrets = [s for s in secrets_list if getattr(s, "visibility", None) == "PRIVATE"]
+
+        if not account_secrets:
+            print("No account-level secrets found")
+            return
+
         # Format secret data (without values for security)
         secrets_data = []
-        for secret in secrets_list:
+        for secret in account_secrets:
             secret_info = {
                 "name": secret.name,
-                "owner": getattr(secret, "owner", "N/A"),
-                "scope": getattr(secret, "scope", "N/A"),
-                "visibility": getattr(secret, "visibility", "N/A"),
+                "scope": "account",
             }
             secrets_data.append(secret_info)
 
@@ -52,19 +62,27 @@ def list_secrets(ctx):
 
 @secrets.command("get")
 @click.argument("name")
-@click.option("--owner", help="Secret owner (defaults to current user)")
 @click.option("--show-value", is_flag=True, help="Show the secret value (use with caution)")
 @click.pass_context
-def get_secret(ctx, name, owner, show_value):
-    """Get secret metadata or value"""
+def get_secret(ctx, name, show_value):
+    """
+    Get account-level secret metadata or value
+
+    Example:
+        hopsworks secret get my_secret
+        hopsworks secret get my_secret --show-value
+    """
     try:
-        get_connection(ctx)
+        get_connection(ctx, require_project=False)
         secrets_api = hopsworks.get_secrets_api()
 
         if show_value:
             # Get the secret value
             print_warning("⚠️  Displaying secret value - use with caution!")
-            secret_value = secrets_api.get(name, owner=owner)
+            try:
+                secret_value = secrets_api.get(name)
+            except Exception as e:
+                raise ResourceNotFoundError(f"Secret '{name}' not found")
 
             if not secret_value:
                 raise ResourceNotFoundError(f"Secret '{name}' not found")
@@ -78,7 +96,10 @@ def get_secret(ctx, name, owner, show_value):
                 click.echo(secret_value)
         else:
             # Get secret metadata only
-            secret = secrets_api.get_secret(name, owner=owner)
+            try:
+                secret = secrets_api.get_secret(name)
+            except Exception as e:
+                raise ResourceNotFoundError(f"Secret '{name}' not found")
 
             if not secret:
                 raise ResourceNotFoundError(f"Secret '{name}' not found")
@@ -86,9 +107,7 @@ def get_secret(ctx, name, owner, show_value):
             # Build secret information (no value)
             secret_data = {
                 "name": secret.name,
-                "owner": getattr(secret, "owner", "N/A"),
-                "scope": getattr(secret, "scope", "N/A"),
-                "visibility": getattr(secret, "visibility", "N/A"),
+                "scope": "account",
             }
 
             # Output formatted results
@@ -96,6 +115,9 @@ def get_secret(ctx, name, owner, show_value):
             output = formatter.format(secret_data, ctx.obj["output_format"])
             click.echo(output)
 
+    except ResourceNotFoundError as e:
+        print_error(str(e))
+        ctx.exit(1)
     except Exception as e:
         print_error(f"Failed to get secret: {e}")
         if ctx.obj.get("verbose"):
@@ -107,43 +129,49 @@ def get_secret(ctx, name, owner, show_value):
 @click.argument("name")
 @click.option("--value", help="Secret value (not recommended, use --value-file instead)")
 @click.option("--value-file", type=click.Path(exists=True), help="Path to file containing secret value")
-@click.option("--project", help="Project scope (optional)")
 @click.pass_context
-def create_secret(ctx, name, value, value_file, project):
-    """Create a new secret"""
+def create_secret(ctx, name, value, value_file):
+    """
+    Create a new account-level secret
+
+    Account-level secrets are accessible across all your projects and are useful
+    for storing credentials, API keys, and other sensitive configuration.
+
+    Example:
+        hopsworks secret create my_api_key --value "secret123"
+        hopsworks secret create my_token --value-file /path/to/token.txt
+        hopsworks secret create my_password   # Prompts for value
+    """
     try:
         # Validate inputs
         if not value and not value_file:
-            print_error("Either --value or --value-file must be provided")
-            ctx.exit(1)
-
-        if value and value_file:
+            # Prompt for value if not provided
+            secret_value = click.prompt("Enter secret value", hide_input=True, confirmation_prompt=True)
+        elif value and value_file:
             print_error("Cannot provide both --value and --value-file")
             ctx.exit(1)
-
-        # Get secret value
-        if value_file:
-            secret_value = Path(value_file).read_text().strip()
         else:
-            secret_value = value
-            if not value:
-                # Prompt for value if not provided
-                secret_value = click.prompt("Enter secret value", hide_input=True)
+            # Get secret value
+            if value_file:
+                secret_value = Path(value_file).read_text().strip()
+            else:
+                secret_value = value
 
-        get_connection(ctx)
+        get_connection(ctx, require_project=False)
         secrets_api = hopsworks.get_secrets_api()
 
-        click.echo(f"Creating secret '{name}'...")
+        click.echo(f"Creating account-level secret '{name}'...")
 
-        # Create the secret
-        secrets_api.create_secret(name, secret_value, project=project)
+        # Create the secret with PRIVATE visibility (account-level)
+        # The API should default to PRIVATE but we can try to enforce it
+        secrets_api.create_secret(name, secret_value)
 
         print_success(f"Secret '{name}' created successfully")
 
         # Show confirmation (no value)
         secret_data = {
             "name": name,
-            "scope": project if project else "user",
+            "scope": "account",
             "status": "created",
         }
 
@@ -160,17 +188,26 @@ def create_secret(ctx, name, value, value_file, project):
 
 @secrets.command("delete")
 @click.argument("name")
-@click.option("--owner", help="Secret owner (defaults to current user)")
 @click.option("--yes", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
-def delete_secret(ctx, name, owner, yes):
-    """Delete a secret"""
+def delete_secret(ctx, name, yes):
+    """
+    Delete an account-level secret
+
+    Example:
+        hopsworks secret delete my_secret
+        hopsworks secret delete my_secret --yes   # Skip confirmation
+    """
     try:
-        get_connection(ctx)
+        get_connection(ctx, require_project=False)
         secrets_api = hopsworks.get_secrets_api()
 
         # Verify secret exists
-        secret = secrets_api.get_secret(name, owner=owner)
+        try:
+            secret = secrets_api.get_secret(name)
+        except Exception as e:
+            raise ResourceNotFoundError(f"Secret '{name}' not found")
+
         if not secret:
             raise ResourceNotFoundError(f"Secret '{name}' not found")
 
@@ -181,10 +218,13 @@ def delete_secret(ctx, name, owner, yes):
                 return
 
         # Delete the secret
-        secrets_api.delete(name, owner=owner)
+        secrets_api.delete(name)
 
         print_success(f"Secret '{name}' deleted successfully")
 
+    except ResourceNotFoundError as e:
+        print_error(str(e))
+        ctx.exit(1)
     except Exception as e:
         print_error(f"Failed to delete secret: {e}")
         if ctx.obj.get("verbose"):
@@ -198,31 +238,38 @@ def delete_secret(ctx, name, owner, yes):
 @click.option("--value-file", type=click.Path(exists=True), help="Path to file containing new secret value")
 @click.pass_context
 def update_secret(ctx, name, value, value_file):
-    """Update an existing secret"""
+    """
+    Update an existing account-level secret
+
+    Example:
+        hopsworks secret update my_secret --value "new_value"
+        hopsworks secret update my_secret --value-file /path/to/new_token.txt
+        hopsworks secret update my_secret   # Prompts for new value
+    """
     try:
         # Validate inputs
         if not value and not value_file:
-            print_error("Either --value or --value-file must be provided")
-            ctx.exit(1)
-
-        if value and value_file:
+            # Prompt for value if not provided
+            secret_value = click.prompt("Enter new secret value", hide_input=True, confirmation_prompt=True)
+        elif value and value_file:
             print_error("Cannot provide both --value and --value-file")
             ctx.exit(1)
-
-        # Get secret value
-        if value_file:
-            secret_value = Path(value_file).read_text().strip()
         else:
-            secret_value = value
-            if not value:
-                # Prompt for value if not provided
-                secret_value = click.prompt("Enter new secret value", hide_input=True)
+            # Get secret value
+            if value_file:
+                secret_value = Path(value_file).read_text().strip()
+            else:
+                secret_value = value
 
-        get_connection(ctx)
+        get_connection(ctx, require_project=False)
         secrets_api = hopsworks.get_secrets_api()
 
         # Verify secret exists
-        secret = secrets_api.get_secret(name)
+        try:
+            secret = secrets_api.get_secret(name)
+        except Exception as e:
+            raise ResourceNotFoundError(f"Secret '{name}' not found")
+
         if not secret:
             raise ResourceNotFoundError(f"Secret '{name}' not found")
 
@@ -234,6 +281,9 @@ def update_secret(ctx, name, value, value_file):
 
         print_success(f"Secret '{name}' updated successfully")
 
+    except ResourceNotFoundError as e:
+        print_error(str(e))
+        ctx.exit(1)
     except Exception as e:
         print_error(f"Failed to update secret: {e}")
         if ctx.obj.get("verbose"):

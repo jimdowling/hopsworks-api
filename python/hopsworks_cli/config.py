@@ -13,7 +13,7 @@ except ImportError:
 
 
 # Default configuration
-DEFAULT_HOST = "stagingmain.devnet.hops.works"
+DEFAULT_HOST = "eu-west.cloud.hopsworks.ai"
 DEFAULT_PORT = 443
 
 # Configuration file location
