@@ -240,7 +240,7 @@ def login(
 
     if api_key is None and is_app:
         print(
-            "Copy your API Key (first register/login): https://c.app.hopsworks.ai/account/api/generated"
+            "Copy your API Key (first register/login): https://eu-west.cloud.hopsworks.ai/account/api/generated"
         )
         api_key = getpass.getpass(prompt="\nPaste it here: ")
 
