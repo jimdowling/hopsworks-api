@@ -14,9 +14,11 @@
 #   limitations under the License.
 
 import pytest
+from hopsworks.client.exceptions import RestAPIError
 from hsml.decorators import (
     HopsworksConnectionError,
     NoHopsworksConnectionError,
+    catch_not_found,
     connected,
     not_connected,
 )
@@ -80,3 +82,106 @@ class TestDecorators:
         # Act
         with pytest.raises(NoHopsworksConnectionError):
             assert_connected(mock_instance, "arg", key_arg="key_arg")
+
+    # test catch_not_found
+
+    def test_catch_not_found_returns_none_on_404_with_matching_error_code(self, mocker):
+        # Arrange
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 404
+        mock_response.json.return_value = {"errorCode": 240000}  # Deployment NOT_FOUND_ERROR_CODE
+
+        @catch_not_found("hsml.deployment.Deployment", fallback_return=None)
+        def func_that_raises():
+            raise RestAPIError("url", mock_response)
+
+        # Act
+        result = func_that_raises()
+
+        # Assert
+        assert result is None
+
+    def test_catch_not_found_returns_none_on_400_with_matching_error_code(self, mocker):
+        # Arrange
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 400
+        mock_response.json.return_value = {"errorCode": 240000}  # Deployment NOT_FOUND_ERROR_CODE
+
+        @catch_not_found("hsml.deployment.Deployment", fallback_return=None)
+        def func_that_raises():
+            raise RestAPIError("url", mock_response)
+
+        # Act
+        result = func_that_raises()
+
+        # Assert
+        assert result is None
+
+    def test_catch_not_found_reraises_on_non_matching_error_code(self, mocker):
+        # Arrange
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 404
+        mock_response.json.return_value = {"errorCode": 999999}  # Different error code
+
+        @catch_not_found("hsml.deployment.Deployment", fallback_return=None)
+        def func_that_raises():
+            raise RestAPIError("url", mock_response)
+
+        # Act & Assert
+        with pytest.raises(RestAPIError):
+            func_that_raises()
+
+    def test_catch_not_found_reraises_on_non_404_status(self, mocker):
+        # Arrange
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 500
+        mock_response.json.return_value = {"errorCode": 240000}
+
+        @catch_not_found("hsml.deployment.Deployment", fallback_return=None)
+        def func_that_raises():
+            raise RestAPIError("url", mock_response)
+
+        # Act & Assert
+        with pytest.raises(RestAPIError):
+            func_that_raises()
+
+    def test_catch_not_found_passes_through_successful_call(self, mocker):
+        # Arrange
+        expected_result = {"id": 1, "name": "test_deployment"}
+
+        @catch_not_found("hsml.deployment.Deployment", fallback_return=None)
+        def func_that_succeeds():
+            return expected_result
+
+        # Act
+        result = func_that_succeeds()
+
+        # Assert
+        assert result == expected_result
+
+    def test_catch_not_found_reraises_non_rest_api_error(self, mocker):
+        # Arrange
+        @catch_not_found("hsml.deployment.Deployment", fallback_return=None)
+        def func_that_raises_value_error():
+            raise ValueError("Some other error")
+
+        # Act & Assert
+        with pytest.raises(ValueError):
+            func_that_raises_value_error()
+
+    def test_catch_not_found_with_custom_fallback_return(self, mocker):
+        # Arrange
+        mock_response = mocker.MagicMock()
+        mock_response.status_code = 404
+        mock_response.json.return_value = {"errorCode": 240000}
+        custom_fallback = {"default": "value"}
+
+        @catch_not_found("hsml.deployment.Deployment", fallback_return=custom_fallback)
+        def func_that_raises():
+            raise RestAPIError("url", mock_response)
+
+        # Act
+        result = func_that_raises()
+
+        # Assert
+        assert result == custom_fallback
