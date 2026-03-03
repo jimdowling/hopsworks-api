@@ -15,10 +15,14 @@
 #
 from __future__ import annotations
 
+import asyncio
+import asyncio
 import json
 import logging
 import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -383,6 +387,7 @@ class FeatureView:
         config_rest_client: dict[str, Any] | None = None,
         default_client: Literal["sql", "rest"] | None = None,
         feature_logger: FeatureLogger | None = None,
+        async_serving: bool = False,
         **kwargs,
     ) -> None:
         """Initialise feature view to retrieve feature vector from online and offline feature store.
@@ -448,6 +453,12 @@ class FeatureView:
             feature_logger:
                 Custom feature logger which [`FeatureView.log`][hsfs.feature_view.FeatureView.log] uses to log feature vectors.
                 If provided, feature vectors will not be inserted to logging feature group automatically when `FeatureView.log` is called.
+            async_serving:
+                If set to `True`, configures the running asyncio event loop's default executor as a
+                `ThreadPoolExecutor` with `(os.cpu_count() or 1) * 8` workers.
+                This prevents `async_get_feature_vector` calls from exhausting the default executor
+                under concurrent load in async web frameworks such as FastAPI.
+                Has no effect when called outside of a running event loop.
         """
         # initiate batch scoring server
         # `training_dataset_version` should not be set if `None` otherwise backend will look up the td.
@@ -506,6 +517,15 @@ class FeatureView:
         else:
             # reset feature logger in case init_serving is called again without feature logger
             self._feature_logger = None
+
+        if async_serving:
+            try:
+                loop = asyncio.get_running_loop()
+                n_workers = (os.cpu_count() or 1) * 8
+                loop.set_default_executor(ThreadPoolExecutor(max_workers=n_workers))
+            except RuntimeError:
+                # No running event loop; async_serving has no effect outside an async context.
+                pass
 
     @staticmethod
     def _sort_transformation_functions(
@@ -768,6 +788,136 @@ class FeatureView:
             request_parameters=request_parameters,
             transformation_context=transformation_context,
             logging_data=logging_data,
+        )
+
+    @public
+    async def async_get_feature_vector(
+        self,
+        entry: dict[str, Any] | None = None,
+        passed_features: dict[str, Any] | None = None,
+        external: bool | None = None,
+        return_type: Literal["list", "polars", "numpy", "pandas"] = "list",
+        allow_missing: bool = False,
+        force_rest_client: bool = False,
+        force_sql_client: bool = False,
+        transform: bool | None = True,
+        on_demand_features: bool | None = True,
+        request_parameters: dict[str, Any] | None = None,
+        transformation_context: dict[str, Any] = None,
+        logging_data: bool = False,
+    ) -> (
+        list[Any]
+        | pd.DataFrame
+        | np.ndarray
+        | pl.DataFrame
+        | HopsworksLoggingMetadataType
+    ):
+        """Returns assembled feature vector from online feature store without blocking the event loop.
+
+        Async wrapper around [`FeatureView.get_feature_vector`][hsfs.feature_view.FeatureView.get_feature_vector]
+        that offloads the blocking online store call to the event loop's default executor,
+        keeping the calling coroutine — and the rest of the asyncio event loop — free to handle
+        other requests while waiting for the result.
+
+        Note: Executor sizing
+            For best results call `init_serving(async_serving=True, ...)` during application
+            startup so the executor is sized for I/O-bound concurrency
+            (`(os.cpu_count() or 1) * 8` workers) rather than the asyncio default.
+
+        Example:
+            ```python
+            import asyncio
+            import hopsworks
+
+            project = hopsworks.login()
+            fs = project.get_feature_store()
+            feature_view = fs.get_feature_view(name="my_fv", version=1)
+
+            async def main():
+                feature_view.init_serving(async_serving=True)
+                vector = await feature_view.async_get_feature_vector(
+                    entry={"pk1": 1, "pk2": 2}
+                )
+
+            asyncio.run(main())
+            ```
+
+        Example: FastAPI endpoint
+            ```python
+            from contextlib import asynccontextmanager
+            from fastapi import FastAPI
+
+            feature_view = ...  # obtain FeatureView instance at module level
+
+            @asynccontextmanager
+            async def lifespan(app: FastAPI):
+                feature_view.init_serving(async_serving=True)
+                yield
+
+            app = FastAPI(lifespan=lifespan)
+
+            @app.get("/predict/{id}")
+            async def predict(id: int):
+                vector = await feature_view.async_get_feature_vector(entry={"id": id})
+                return {"prediction": model.predict([vector])}
+            ```
+
+        Parameters:
+            entry:
+                Dictionary of feature group primary key and values provided by serving application.
+                Set of required primary keys is [`FeatureView.primary_keys`][hsfs.feature_view.FeatureView.primary_keys].
+                If the required primary keys is not provided, it will look for name of the primary key in feature group in the entry.
+            passed_features:
+                Dictionary of feature values provided by the application at runtime.
+                They can replace features values fetched from the feature store as well as providing feature values which are not available in the feature store.
+                These values take priority over features retrieved from the online feature store but are overridden by `request_parameters` if the same key exists in both.
+            external:
+                If set to `True`, the connection to the online feature store is established using the same host as for the `host` parameter in the [`hopsworks.login`][hopsworks.login] method.
+                If set to `False`, the online feature store storage connector is used which relies on the private IP.
+                Defaults to `True` if connection to Hopsworks is established from external environment (e.g AWS Sagemaker or Google Colab), otherwise to `False`.
+            return_type: In which format to return the feature vector.
+            allow_missing: Setting to `True` returns feature vectors with missing values.
+            force_rest_client:
+                If set to True, reads from online feature store using the REST client if initialised.
+            force_sql_client:
+                If set to True, reads from online feature store using the SQL client if initialised.
+            transform:
+                If set to `True`, model-dependent transformations are applied to the feature vector, and `on_demand_feature` is automatically set to `True`, ensuring the inclusion of on-demand features.
+                If set to `False`, the function returns the feature vector without applying any model-dependent transformations.
+            on_demand_features: Setting this to `False` returns untransformed feature vectors without any on-demand features.
+            request_parameters: Request parameters required by on-demand transformation functions to compute on-demand features present in the feature view.
+                These parameters take **highest priority** when resolving feature values - if a key exists in both `request_parameters` and `passed_features` or in the retrieved feature vector, the value from `request_parameters` is used.
+            transformation_context:
+                A dictionary mapping variable names to objects that will be provided as contextual information to the transformation function at runtime.
+                The `context` variable must be explicitly defined as parameters in the transformation function for these to be accessible during execution.
+                If no context variables are provided, this parameter defaults to `None`.
+            logging_data:
+                Setting this to `True` return feature vector with logging metadata.
+                The feature vector will contain only the required features.
+                The logging metadata is available as part of an additional attribute `hopsworks_logging_metadata` of the returned object.
+                The logging metadata contains the untransformed features, transformed features, inference helpers, serving keys, request parameters and event time.
+                The feature vector object returned can be passed to `feature_view.log()` to log the feature vector along with all the logging metadata.
+
+        Returns:
+            Returned `list`, `pd.DataFrame`, `polars.DataFrame` or `np.ndarray` (the exact type depends on `return_type`) contains feature values related to provided primary keys, ordered according to positions of this features in the feature view query.
+
+        Raises:
+            hopsworks.client.exceptions.FeatureStoreException: When primary key entry cannot be found in one or more of the feature groups used by this feature view.
+        """
+        return await asyncio.to_thread(
+            self.get_feature_vector,
+            entry,
+            passed_features,
+            external,
+            return_type,
+            allow_missing,
+            force_rest_client,
+            force_sql_client,
+            transform,
+            on_demand_features,
+            request_parameters,
+            transformation_context,
+            logging_data,
         )
 
     @public
