@@ -721,7 +721,7 @@ class Engine:
             if HAS_POLARS and (
                 isinstance(df, (pl.DataFrame, pl.dataframe.frame.DataFrame))
             ):
-                stats[col] = dict(zip(stats["statistic"], stats[col]))
+                stats[col] = dict(zip(stats["statistic"], stats[col], strict=False))
             # set data type
             arrow_type = arrow_schema.field(col).type
             if (
@@ -1111,11 +1111,12 @@ class Engine:
                     pd.to_datetime(dataframe[event_time], utc=True) > threshold
                 ).tolist()
             return [True] * len(dataframe)
+        df = dataframe.reset_index(drop=True)
         if event_time:
-            max_idx = dataframe.groupby(pk_cols, sort=False)[event_time].idxmax()
+            max_idx = df.groupby(pk_cols, sort=False)[event_time].idxmax()
         else:
-            max_idx = dataframe.groupby(pk_cols, sort=False).tail(1).index
-        flags = pd.Series(False, index=dataframe.index)
+            max_idx = df.groupby(pk_cols, sort=False).tail(1).index
+        flags = pd.Series(False, index=df.index)
         flags.loc[max_idx] = True
         return flags.tolist()
 
@@ -1169,6 +1170,7 @@ class Engine:
                 dataframe,
                 write_options=offline_write_options,
                 validation_id=validation_id,
+                operation=operation,
             )
             inserted = True
         if storage in [None, "online"] and feature_group.online_enabled:
@@ -1758,6 +1760,7 @@ class Engine:
                         zip(
                             transformed_features.columns,
                             hopsworks_udf.output_column_names,
+                            strict=False,
                         )
                     )
                 )
@@ -1794,36 +1797,18 @@ class Engine:
             else:
                 dataframe = dataframe.to_pandas(use_pyarrow_extension_array=False)
 
+        features = [dataframe[f] for f in hopsworks_udf.transformation_features]
+        # Index is set to the input dataframe index so that pandas would merge the new columns without reordering them.
+        output = hopsworks_udf.get_udf(online=online)(*features)
+        output_names = hopsworks_udf.output_column_names
         if len(hopsworks_udf.return_types) > 1:
-            dataframe[hopsworks_udf.output_column_names] = hopsworks_udf.get_udf(
-                online=online
-            )(
-                *(
-                    [
-                        dataframe[feature]
-                        for feature in hopsworks_udf.transformation_features
-                    ]
-                )
-            ).set_index(
-                dataframe.index
-            )  # Index is set to the input dataframe index so that pandas would merge the new columns without reordering them.
+            dataframe[output_names] = output.set_index(dataframe.index)
         else:
-            dataframe[hopsworks_udf.output_column_names[0]] = hopsworks_udf.get_udf(
-                online=online
-            )(
-                *(
-                    [
-                        dataframe[feature]
-                        for feature in hopsworks_udf.transformation_features
-                    ]
-                )
-            ).set_axis(
-                dataframe.index
-            )  # Index is set to the input dataframe index so that pandas would merge the new column without reordering it.
-            if hopsworks_udf.output_column_names[0] in dataframe.columns:
+            dataframe[output_names[0]] = output.set_axis(dataframe.index)
+            if output_names[0] in dataframe.columns:
                 # Overwriting features also reordering dataframe to move overwritten column to the end of the dataframe
                 cols = dataframe.columns.tolist()
-                cols.append(cols.pop(cols.index(hopsworks_udf.output_column_names[0])))
+                cols.append(cols.pop(cols.index(output_names[0])))
                 dataframe = dataframe[cols]
         return dataframe
 
@@ -1884,6 +1869,7 @@ class Engine:
         for row, online_flag in zip(
             row_iterator,
             online_flags if online_flags is not None else itertools.repeat(None),
+            strict=False,
         ):
             if isinstance(dataframe, pd.DataFrame):
                 # itertuples returns Python NamedTuple; convert to dict to serialize via Avro
@@ -2721,14 +2707,16 @@ class Engine:
 
             if log_vectors is None:
                 log_vectors = [
-                    dict(zip(feature_names, row)) if not isinstance(row, dict) else row
+                    dict(zip(feature_names, row, strict=False))
+                    if not isinstance(row, dict)
+                    else row
                     for row in data
                 ]
             # If one of the logging components has only one row and the other has multiple rows, we repeat the single row to match the length of the other component.
             elif len(data) == 1:
                 for log_vector in log_vectors:
                     log_vector.update(
-                        dict(zip(feature_names, data[0]))
+                        dict(zip(feature_names, data[0], strict=False))
                         if not isinstance(data[0], dict)
                         else data[0]
                     )
@@ -2738,9 +2726,9 @@ class Engine:
                         f"Length of `{log_component_name}` provided do not match other arguments. Please check the logging data to make sure that all arguments have the same length."
                     )
             else:
-                for log_vector, row in zip(log_vectors, data):
+                for log_vector, row in zip(log_vectors, data, strict=False):
                     log_vector.update(
-                        dict(zip(feature_names, row))
+                        dict(zip(feature_names, row, strict=False))
                         if not isinstance(row, dict)
                         else row
                     )
@@ -2761,7 +2749,7 @@ class Engine:
             # Get any request parameters that the user passed explicitly.
             if request_parameter_data is not None:
                 request_parameter_data = [
-                    dict(zip(request_parameter_names, row))
+                    dict(zip(request_parameter_names, row, strict=False))
                     if not isinstance(row, dict)
                     else row
                     for row in request_parameter_data
@@ -2770,7 +2758,9 @@ class Engine:
                 request_parameter_data = [{} for _ in range(len(log_vectors))]
 
             # Iterate through the log vectors and try to parse request parameters from the log vector if they are not explicitly passed by the user.
-            for log_vector, passed_rp_data in zip(log_vectors, request_parameter_data):
+            for log_vector, passed_rp_data in zip(
+                log_vectors, request_parameter_data, strict=False
+            ):
                 for col in request_parameter_names:
                     if col not in passed_rp_data and col in log_vector:
                         passed_rp_data[col] = log_vector[col]

@@ -1904,7 +1904,7 @@ class TestPython:
 
         # Verify save_delta_fg was called with correct parameters
         mock_delta_engine.return_value.save_delta_fg.assert_called_once_with(
-            test_dataframe, write_options={}, validation_id=None
+            test_dataframe, write_options={}, validation_id=None, operation="insert"
         )
 
     def test_save_dataframe_delta_calls_check_duplicate_records(self, mocker):
@@ -7524,7 +7524,7 @@ class TestPython:
 
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_column_names:
                     assert row[key] == expected_row[key]
@@ -7601,7 +7601,7 @@ class TestPython:
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_column_names:
                     assert row[key] == expected_row[key]
@@ -7681,7 +7681,7 @@ class TestPython:
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_column_names:
                     assert row[key] == expected_row[key]
@@ -7761,7 +7761,7 @@ class TestPython:
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_column_names:
                     assert row[key] == expected_row[key]
@@ -7841,7 +7841,7 @@ class TestPython:
 
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_columnn_names:
                     assert row[key] == expected_row[key]
@@ -7923,7 +7923,7 @@ class TestPython:
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_column_names:
                     assert row[key] == expected_row[key]
@@ -8005,7 +8005,7 @@ class TestPython:
 
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_column_names:
                     assert row[key] == expected_row[key]
@@ -8093,7 +8093,7 @@ class TestPython:
             meta_data_logging_columns=meta_data_logging_columns,
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_columns_names:
                     assert row[key] == expected_row[key]
@@ -8173,7 +8173,7 @@ class TestPython:
             meta_data_logging_columns=meta_data_logging_columns,
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_columns_names:
                     assert row[key] == expected_row[key]
@@ -8259,7 +8259,7 @@ class TestPython:
             meta_data_logging_columns=meta_data_logging_columns,
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_columns_names:
                     assert row[key] == expected_row[key]
@@ -8338,7 +8338,7 @@ class TestPython:
             meta_data_logging_columns=meta_data_logging_columns,
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_columns_names:
                     assert row[key] == expected_row[key]
@@ -8422,7 +8422,7 @@ class TestPython:
 
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_columns_names:
                     assert row[key] == expected_row[key]
@@ -8501,7 +8501,7 @@ class TestPython:
             meta_data_logging_columns=meta_data_logging_columns,
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_column_names:
                     assert row[key] == expected_row[key]
@@ -8587,7 +8587,7 @@ class TestPython:
             meta_data_logging_columns=meta_data_logging_columns,
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_column_names:
                     assert row[key] == expected_row[key]
@@ -8667,7 +8667,7 @@ class TestPython:
             meta_data_logging_columns=meta_data_logging_columns,
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_column_names:
                     assert row[key] == expected_row[key]
@@ -8710,7 +8710,7 @@ class TestPython:
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_column_names:
                     assert row[key] == expected_row[key]
@@ -8787,7 +8787,7 @@ class TestPython:
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_column_names:
                     assert row[key] == expected_row[key]
@@ -8830,7 +8830,7 @@ class TestPython:
             meta_data_logging_columns=meta_data_logging_columns,
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_column_names:
                     assert row[key] == expected_row[key]
@@ -8912,7 +8912,7 @@ class TestPython:
             meta_data_logging_columns=meta_data_logging_columns,
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_columns_names:
                     assert row[key] == expected_row[key]
@@ -9000,7 +9000,7 @@ class TestPython:
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_columns_names:
                     assert row[key] == expected_row[key]
@@ -9146,7 +9146,7 @@ class TestPython:
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
         # Assert
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_columns_name:
                     assert row[key] == expected_row[key]
@@ -9295,7 +9295,7 @@ class TestPython:
         )
         expected_logging_list = expected_log_data.to_dict(orient="records")
 
-        for row, expected_row in zip(logging_list, expected_logging_list):
+        for row, expected_row in zip(logging_list, expected_logging_list, strict=False):
             for key in row:
                 if key not in meta_data_logging_columns_name:
                     assert row[key] == expected_row[key]
@@ -9355,7 +9355,7 @@ class TestPython:
             """Filter a dataframe using a list of booleans returned by _mark_online_rows."""
             if HAS_POLARS and isinstance(df, pl.DataFrame):
                 return df.filter(pl.Series(flags))
-            return df[flags].reset_index(drop=True)
+            return df[flags]
 
         @pytest.mark.parametrize(
             "use_polars",

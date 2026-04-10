@@ -31,7 +31,7 @@ from typing import (
 import avro.schema
 import hsfs.expectation_suite
 import humps
-from hopsworks_apigen import public
+from hopsworks_apigen import deprecation, public
 from hopsworks_common import job
 from hopsworks_common.client.exceptions import FeatureStoreException, RestAPIError
 from hopsworks_common.core import alerts_api
@@ -2466,8 +2466,10 @@ class FeatureGroupBase:
     @data_source.setter
     def data_source(self, data_source: ds.DataSource) -> None:
         self._data_source = data_source
-        if self._data_source is not None:
-            self._data_source._update_storage_connector(self.storage_connector)
+        if self._data_source is not None and self._data_source.storage_connector:
+            self._data_source._update_storage_connector(
+                self._data_source.storage_connector
+            )
 
     @public
     def prepare_spark_location(self) -> str:
@@ -2560,7 +2562,28 @@ class FeatureGroupBase:
     @public
     @property
     def features(self) -> list[feature.Feature]:
-        """Feature Group schema (alias)."""
+        """Feature Group schema (alias).
+
+        Warning:
+            hsfs.feature_group.FeatureGroupBase.features is deprecated.
+            The function will be removed in a future release of hopsworks."
+            Consider using [`FeatureGroupBase.columns`][hsfs.feature_group.FeatureGroupBase.columns] instead."
+        """
+        warnings.warn(
+            deprecation.generate_deprecation_message(
+                "hsfs.feature_group.FeatureGroupBase.features",
+                "hsfs.feature_group.FeatureGroupBase.columns",
+            ),
+            deprecation.HopsworksDeprecationWarning,
+            stacklevel=2,
+        )
+
+        return self.columns
+
+    @public
+    @property
+    def columns(self) -> list[feature.Feature]:
+        """Feature Group schema as a list of all feature definitions, including name, type, and metadata such as primary key or event time flags."""
         return self._features
 
     @public
@@ -2568,6 +2591,15 @@ class FeatureGroupBase:
     def schema(self) -> list[feature.Feature]:
         """Feature Group schema."""
         return self._features
+
+    @public
+    @property
+    def column_names(self) -> list[str]:
+        """Feature Group column names without type or metadata information, as plain strings.
+
+        The order is the same as in the [`schema`][hsfs.feature_group.FeatureGroupBase.schema] and [`columns`][hsfs.feature_group.FeatureGroupBase.columns].
+        """
+        return [f.name for f in self._features]
 
     def _are_statistics_missing(self, statistics: Statistics) -> bool:
         if not self.statistics_config.enabled:
@@ -2613,7 +2645,20 @@ class FeatureGroupBase:
 
     @features.setter
     def features(self, new_features: list[feature.Feature]) -> None:
-        self._features = new_features
+        warnings.warn(
+            deprecation.generate_deprecation_message(
+                "hsfs.feature_group.FeatureGroupBase.features",
+                "hsfs.feature_group.FeatureGroupBase.columns",
+            ),
+            deprecation.HopsworksDeprecationWarning,
+            stacklevel=2,
+        )
+
+        self.columns = new_features
+
+    @columns.setter
+    def columns(self, new_columns: list[feature.Feature]) -> None:
+        self._features = new_columns
 
     def _get_project_name(self) -> str:
         return util.strip_feature_store_suffix(self.feature_store_name)
@@ -4335,7 +4380,7 @@ class FeatureGroup(FeatureGroupBase):
                     json_dict["sinkJob"]
                 )
             return cls(**json_decamelized)
-        for raw_fg, fg in zip(json_dict, json_decamelized):
+        for raw_fg, fg in zip(json_dict, json_decamelized, strict=False):
             if "type" in fg:
                 fg["stream"] = fg["type"] == "streamFeatureGroupDTO"
             _ = fg.pop("type", None)
