@@ -29,6 +29,7 @@ from hopsworks_common.constants import (
 )
 from hsml import deployment
 from hsml.deployable_component import DeployableComponent
+from hsml.deployment_schema import DeploymentSchema
 from hsml.inference_batcher import InferenceBatcher
 from hsml.inference_logger import InferenceLogger
 from hsml.predictor_state import PredictorState
@@ -78,6 +79,8 @@ class Predictor(DeployableComponent):
         project_namespace: str = None,
         scaling_configuration: PredictorScalingConfig | dict | Default | None = None,
         env_vars: dict[str, str] | None = None,
+        deployment_schema: DeploymentSchema | dict | None = None,
+        passed_features: list[str] | None = None,
         **kwargs,
     ):
         serving_tool = (
@@ -126,6 +129,11 @@ class Predictor(DeployableComponent):
         self._project_namespace = project_namespace
         self._project_name = None
         self._env_vars = env_vars
+        if isinstance(deployment_schema, dict):
+            self._deployment_schema = DeploymentSchema.from_dict(deployment_schema)
+        else:
+            self._deployment_schema = deployment_schema
+        self._passed_features = list(passed_features) if passed_features else None
 
     @public
     def deploy(self) -> deployment.Deployment:
@@ -331,6 +339,12 @@ class Predictor(DeployableComponent):
         kwargs["scaling_configuration"] = PredictorScalingConfig.from_json(
             json_decamelized
         )
+        if "deployment_schema" in json_decamelized:
+            schema_payload = json_decamelized.pop("deployment_schema")
+            if schema_payload:
+                kwargs["deployment_schema"] = DeploymentSchema.from_dict(schema_payload)
+        if "passed_features" in json_decamelized:
+            kwargs["passed_features"] = json_decamelized.pop("passed_features")
         return kwargs
 
     def update_from_response_json(self, json_dict):
@@ -382,6 +396,10 @@ class Predictor(DeployableComponent):
             json = {**json, **self._transformer.to_dict()}
         if self._scaling_configuration is not None:
             json = {**json, **self._scaling_configuration.to_dict()}
+        if self._deployment_schema is not None:
+            json = {**json, "deploymentSchema": self._deployment_schema.to_dict()}
+        if self._passed_features:
+            json = {**json, "passedFeatures": list(self._passed_features)}
         return json
 
     @public
@@ -621,6 +639,26 @@ class Predictor(DeployableComponent):
     @project_name.setter
     def project_name(self, project_name: str):
         self._project_name = project_name
+
+    @public
+    @property
+    def deployment_schema(self) -> DeploymentSchema | None:
+        """Schema describing the predictor's input categories and output labels."""
+        return self._deployment_schema
+
+    @deployment_schema.setter
+    def deployment_schema(self, deployment_schema: DeploymentSchema | None) -> None:
+        self._deployment_schema = deployment_schema
+
+    @public
+    @property
+    def passed_features(self) -> list[str] | None:
+        """Feature view features the client supplies directly as request inputs."""
+        return self._passed_features
+
+    @passed_features.setter
+    def passed_features(self, passed_features: list[str] | None) -> None:
+        self._passed_features = list(passed_features) if passed_features else None
 
     @public
     def get_endpoint_url(self) -> str | None:

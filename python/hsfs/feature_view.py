@@ -117,6 +117,41 @@ SplineDataFrameTypes = (
 _logger = logging.getLogger(__name__)
 
 
+_SCHEMA_CATEGORIES = (
+    "serving_keys",
+    "inference_helpers",
+    "passed_features",
+    "request_parameters",
+)
+
+
+def _extract_schema_buckets(deployment_schema: Any) -> dict[str, set[str]]:
+    """Return category-name sets extracted from a DeploymentSchema or its dict form."""
+    if deployment_schema is None:
+        raise ValueError(
+            "parse_inputs requires a deployment_schema; pass deployment.deployment_schema"
+        )
+    if isinstance(deployment_schema, dict):
+        result = {cat: set() for cat in _SCHEMA_CATEGORIES}
+        for entry in deployment_schema.get("columnar_schema", []) or []:
+            for category, columns in entry.items():
+                if category in result:
+                    for col in columns or []:
+                        if isinstance(col, dict) and "name" in col:
+                            result[category].add(col["name"])
+        return result
+    result = {cat: set() for cat in _SCHEMA_CATEGORIES}
+    for category in _SCHEMA_CATEGORIES:
+        cols = getattr(deployment_schema, category, None) or []
+        for col in cols:
+            name = getattr(col, "name", None) or (
+                col.get("name") if isinstance(col, dict) else None
+            )
+            if name is not None:
+                result[category].add(name)
+    return result
+
+
 @public
 @typechecked
 class FeatureView:
@@ -765,6 +800,68 @@ class FeatureView:
             transformation_context=transformation_context,
             logging_data=logging_data,
         )
+
+    @public
+    def parse_inputs(
+        self,
+        inputs: dict[str, Any],
+        deployment_schema: Any,
+        strict: bool = True,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Partition a prediction request into the deployment's four input categories.
+
+        Returns ``(serving_keys, inference_helpers, passed_features, request_parameters)``
+        based on the category membership declared in ``deployment_schema``.
+        Serving-key keys accept both the prefixed
+        [`ServingKey.required_serving_key`][hsfs.serving_key.ServingKey.required_serving_key]
+        and the bare feature name; the returned dict always uses the prefixed
+        form so it can be passed directly to
+        [`FeatureView.get_feature_vector`][hsfs.feature_view.FeatureView.get_feature_vector].
+        When ``strict`` is true, unknown keys and missing required serving keys raise.
+        """
+        buckets = _extract_schema_buckets(deployment_schema)
+        sk_alias_to_canonical = self._build_serving_key_alias_map(
+            buckets["serving_keys"]
+        )
+        serving_keys: dict[str, Any] = {}
+        inference_helpers: dict[str, Any] = {}
+        passed_features: dict[str, Any] = {}
+        request_parameters: dict[str, Any] = {}
+        unknown: list[str] = []
+        for key, value in inputs.items():
+            if key in sk_alias_to_canonical:
+                serving_keys[sk_alias_to_canonical[key]] = value
+            elif key in buckets["inference_helpers"]:
+                inference_helpers[key] = value
+            elif key in buckets["passed_features"]:
+                passed_features[key] = value
+            elif key in buckets["request_parameters"]:
+                request_parameters[key] = value
+            else:
+                unknown.append(key)
+        if strict and unknown:
+            raise ValueError(
+                "Unknown input keys for deployment schema: "
+                + ", ".join(sorted(unknown))
+            )
+        if strict:
+            missing = sorted(buckets["serving_keys"] - set(serving_keys.keys()))
+            if missing:
+                raise ValueError("Missing required serving keys: " + ", ".join(missing))
+        return serving_keys, inference_helpers, passed_features, request_parameters
+
+    def _build_serving_key_alias_map(
+        self, canonical_serving_keys: set[str]
+    ) -> dict[str, str]:
+        alias_to_canonical: dict[str, str] = {
+            name: name for name in canonical_serving_keys
+        }
+        for sk in self.serving_keys or []:
+            canonical = sk.required_serving_key
+            if canonical not in canonical_serving_keys:
+                continue
+            alias_to_canonical.setdefault(sk.feature_name, canonical)
+        return alias_to_canonical
 
     @public
     def get_feature_vectors(

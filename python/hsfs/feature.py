@@ -31,6 +31,56 @@ if TYPE_CHECKING:
     from hsfs.feature_group import FeatureGroup
 
 
+# region OFS type allow-list
+
+OFS_BASE_TYPES = frozenset(
+    {
+        "int",
+        "bigint",
+        "smallint",
+        "tinyint",
+        "float",
+        "double",
+        "decimal",
+        "string",
+        "varchar",
+        "char",
+        "timestamp",
+        "date",
+        "boolean",
+        "binary",
+    }
+)
+
+_OFS_PARAM_PREFIXES = ("array<", "struct<", "decimal(", "varchar(", "char(")
+
+
+def is_ofs_type(type_str: str | None) -> bool:
+    """Check whether a type string is an Online Feature Store type."""
+    if not type_str:
+        return False
+    t = type_str.lower().strip()
+    if t in OFS_BASE_TYPES:
+        return True
+    return any(t.startswith(p) for p in _OFS_PARAM_PREFIXES)
+
+
+def to_online_type(feature: Any) -> str | None:
+    """Return the Online Feature Store type for a feature.
+
+    Uses ``online_type`` when set on the Feature, otherwise falls back to
+    the offline ``type``.
+    Accepts both ``hsfs.feature.Feature`` and ``hsfs.training_dataset_feature.TrainingDatasetFeature``.
+    """
+    online = getattr(feature, "online_type", None)
+    if online:
+        return online
+    return getattr(feature, "type", None)
+
+
+# endregion
+
+
 @public
 @typechecked
 class Feature:

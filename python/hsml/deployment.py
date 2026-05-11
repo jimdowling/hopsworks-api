@@ -491,6 +491,19 @@ class Deployment:
         """Print a JSON description of the deployment."""
         util.pretty_print(self)
 
+    @public
+    def describe_schema(self) -> dict | None:
+        """Return the deployment schema as a JSON-serializable dictionary.
+
+        Includes the four input categories (serving_keys, inference_helpers,
+        passed_features, request_parameters) and the output schema derived
+        from the feature view's labels.
+        Returns ``None`` if the deployment has no schema attached, for
+        example vLLM deployments or explicit user opt-out.
+        """
+        schema = self._predictor.deployment_schema
+        return schema.to_dict() if schema is not None else None
+
     @classmethod
     def from_response_json(cls, json_dict):
         predictors = predictor_mod.Predictor.from_response_json(json_dict)
@@ -725,6 +738,40 @@ class Deployment:
     @transformer.setter
     def transformer(self, transformer: Transformer):
         self._predictor.transformer = transformer
+
+    @public
+    @property
+    def deployment_schema(self):
+        """Schema describing the deployment's inputs and outputs."""
+        return self._predictor.deployment_schema
+
+    @deployment_schema.setter
+    def deployment_schema(self, deployment_schema):
+        self._predictor.deployment_schema = deployment_schema
+
+    @public
+    @property
+    def passed_features(self) -> list[str] | None:
+        """Feature view features supplied directly by the client at predict time."""
+        return self._predictor.passed_features
+
+    @passed_features.setter
+    def passed_features(self, passed_features: list[str] | None) -> None:
+        self._predictor.passed_features = passed_features
+
+    @public
+    @property
+    def input_schema(self) -> dict | None:
+        """Input portion of the deployment schema."""
+        schema = self._predictor.deployment_schema
+        return schema.input_schema if schema is not None else None
+
+    @public
+    @property
+    def output_schema(self):
+        """Output portion of the deployment schema."""
+        schema = self._predictor.deployment_schema
+        return schema.output_schema if schema is not None else None
 
     @public
     @property

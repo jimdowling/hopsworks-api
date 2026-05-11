@@ -241,6 +241,8 @@ class TestModel:
             api_protocol=p_json["api_protocol"],
             environment=p_json["environment_dto"]["name"],
             env_vars=None,
+            deployment_schema=None,
+            passed_features=None,
         )
         mock_predictor.deploy.assert_called_once()
 

@@ -26,8 +26,10 @@ import humps
 from hopsworks_apigen import public
 from hopsworks_common import client, usage, util
 from hopsworks_common.constants import INFERENCE_ENDPOINTS as IE
-from hopsworks_common.constants import MODEL_REGISTRY
+from hopsworks_common.constants import MODEL_REGISTRY, PREDICTOR
+from hsml.client.exceptions import ModelServingException
 from hsml.core import explicit_provenance
+from hsml.deployment_schema import DeploymentSchema
 from hsml.engine import model_engine
 from hsml.model_schema import ModelSchema
 from hsml.predictor import Predictor
@@ -45,6 +47,16 @@ if TYPE_CHECKING:
 
 
 _logger = logging.getLogger(__name__)
+
+
+def _passed_feature_names(
+    passed_features: dict[str, str] | list[str] | None,
+) -> list[str] | None:
+    if not passed_features:
+        return None
+    if isinstance(passed_features, dict):
+        return list(passed_features.keys())
+    return list(passed_features)
 
 
 @public
@@ -225,6 +237,10 @@ class Model:
         api_protocol: str | None = IE.API_PROTOCOL_REST,
         environment: str | None = None,
         env_vars: dict | None = None,
+        deployment_schema: DeploymentSchema | None = None,
+        passed_features: dict[str, str] | list[str] | None = None,
+        request_parameters: dict[str, str] | None = None,
+        infer_deployment_schema: bool = True,
     ) -> deployment.Deployment:
         """Deploy the model.
 
@@ -261,6 +277,15 @@ class Model:
             api_protocol: API protocol to be enabled in the deployment (i.e., 'REST' or 'GRPC').
             environment: The inference environment to use.
             env_vars: Environment variables to set on the predictor.
+            deployment_schema: Explicit schema describing the deployment's inputs and outputs.
+                Overrides automatic inference from the linked feature view.
+            passed_features: Feature-view feature names (or name-to-type map) that the
+                caller will supply directly at predict time, bypassing online lookup.
+            request_parameters: Extra typed request parameters (e.g. model-dependent
+                transformation inputs) to add on top of the feature view's on-demand parameters.
+            infer_deployment_schema: When true, infer a deployment schema from the model's
+                feature view if no explicit schema is provided.
+                Skipped automatically for vLLM deployments.
 
         Returns:
             The deployment metadata object of a new or existing deployment.
@@ -270,6 +295,14 @@ class Model:
         """
         if name is None:
             name = self._get_default_serving_name()
+
+        resolved_schema = self._resolve_deployment_schema(
+            deployment_schema=deployment_schema,
+            passed_features=passed_features,
+            request_parameters=request_parameters,
+            infer_deployment_schema=infer_deployment_schema,
+        )
+        resolved_passed_features = _passed_feature_names(passed_features)
 
         predictor = Predictor.for_model(
             self,
@@ -286,9 +319,48 @@ class Model:
             api_protocol=api_protocol,
             environment=environment,
             env_vars=env_vars,
+            deployment_schema=resolved_schema,
+            passed_features=resolved_passed_features,
         )
 
         return predictor.deploy()
+
+    def _resolve_deployment_schema(
+        self,
+        deployment_schema: DeploymentSchema | None,
+        passed_features: dict[str, str] | list[str] | None,
+        request_parameters: dict[str, str] | None,
+        infer_deployment_schema: bool,
+    ) -> DeploymentSchema | None:
+        if deployment_schema is not None:
+            return deployment_schema
+        if not infer_deployment_schema:
+            return None
+        model_server = Predictor._infer_model_server(self._framework)
+        if model_server == PREDICTOR.MODEL_SERVER_VLLM:
+            return None
+        strict = passed_features is not None or request_parameters is not None
+        try:
+            fv = self.get_feature_view(init=False)
+        except Exception:
+            if strict:
+                raise
+            _logger.debug(
+                "Skipping deployment schema inference: feature view lookup failed",
+                exc_info=True,
+            )
+            return None
+        if fv is None:
+            if strict:
+                raise ModelServingException(
+                    "Deployment schema inference requires the model to have a feature view"
+                )
+            return None
+        return DeploymentSchema.from_feature_view(
+            fv,
+            passed_features=passed_features,
+            request_parameters=request_parameters,
+        )
 
     @public
     @usage.method_logger

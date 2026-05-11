@@ -430,6 +430,104 @@ class TestFeatureView:
         # Assert
         assert required_serving_keys == ["primary_key"]
 
+    def test_parse_inputs_routes_keys_into_buckets(self, mocker):
+        mocker.patch("hopsworks_common.client.get_instance")
+        mocker.patch("hsfs.engine.get_type", return_value="python")
+
+        fv = feature_view.FeatureView(
+            name="fv_name",
+            query=fg1.select_features().join(fg2.select_features()),
+            featurestore_id=99,
+            featurestore_name="test_fs",
+            inference_helper_columns=["ihelp"],
+            labels=["label"],
+        )
+        fv._serving_keys = [
+            ServingKey(
+                feature_name="cc_num",
+                join_index=0,
+                feature_group=fg1,
+                required=True,
+                prefix="",
+                ignore_prefix=True,
+            ),
+        ]
+        deployment_schema = {
+            "columnar_schema": [
+                {"serving_keys": [{"name": "cc_num", "type": "bigint"}]},
+                {"inference_helpers": [{"name": "ihelp", "type": "double"}]},
+                {"passed_features": [{"name": "amount", "type": "double"}]},
+                {"request_parameters": [{"name": "dob", "type": "timestamp"}]},
+            ]
+        }
+
+        sk, ih, pf, rp = fv.parse_inputs(
+            {"cc_num": 1, "ihelp": 0.5, "amount": 12.5, "dob": "2020-01-01"},
+            deployment_schema,
+        )
+
+        assert sk == {"cc_num": 1}
+        assert ih == {"ihelp": 0.5}
+        assert pf == {"amount": 12.5}
+        assert rp == {"dob": "2020-01-01"}
+
+    def test_parse_inputs_strict_rejects_unknown_keys(self, mocker):
+        mocker.patch("hopsworks_common.client.get_instance")
+        mocker.patch("hsfs.engine.get_type", return_value="python")
+
+        fv = feature_view.FeatureView(
+            name="fv",
+            query=fg1.select_features().join(fg2.select_features()),
+            featurestore_id=99,
+            featurestore_name="test_fs",
+            labels=["label"],
+        )
+        fv._serving_keys = [
+            ServingKey(
+                feature_name="cc_num",
+                join_index=0,
+                feature_group=fg1,
+                required=True,
+                ignore_prefix=True,
+            )
+        ]
+        schema = {
+            "columnar_schema": [
+                {"serving_keys": [{"name": "cc_num", "type": "bigint"}]},
+            ]
+        }
+        with pytest.raises(ValueError, match="Unknown input keys"):
+            fv.parse_inputs({"cc_num": 1, "mystery": 42}, schema)
+
+    def test_parse_inputs_strict_rejects_missing_serving_keys(self, mocker):
+        mocker.patch("hopsworks_common.client.get_instance")
+        mocker.patch("hsfs.engine.get_type", return_value="python")
+
+        fv = feature_view.FeatureView(
+            name="fv",
+            query=fg1.select_features().join(fg2.select_features()),
+            featurestore_id=99,
+            featurestore_name="test_fs",
+            labels=["label"],
+        )
+        fv._serving_keys = [
+            ServingKey(
+                feature_name="cc_num",
+                join_index=0,
+                feature_group=fg1,
+                required=True,
+                ignore_prefix=True,
+            )
+        ]
+        schema = {
+            "columnar_schema": [
+                {"serving_keys": [{"name": "cc_num", "type": "bigint"}]},
+                {"request_parameters": [{"name": "dob", "type": "timestamp"}]},
+            ]
+        }
+        with pytest.raises(ValueError, match="Missing required serving keys"):
+            fv.parse_inputs({"dob": "2020-01-01"}, schema)
+
     def test_root_feature_group_event_time_column_name(self, mocker):
         # Arrange
         mocker.patch("hopsworks_common.client.get_instance")
