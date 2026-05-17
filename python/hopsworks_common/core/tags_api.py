@@ -31,11 +31,17 @@ if TYPE_CHECKING:
 @also_available_as("hopsworks.core.tags_api.TagsApi", "hsfs.core.tags_api.TagsApi")
 class TagsApi:
     def __init__(self, feature_store_id: int, entity_type: str):
-        """Tags endpoint for `trainingdatasets` and `featuregroups` resource.
+        """Tags endpoint for tagged Hopsworks assets.
+
+        Supported entity types:
+        - `featuregroups`, `trainingdatasets`, `featureview` — feature-store scoped (require `feature_store_id`).
+        - `models` — model registry; uses the model registry path under `modelregistries/{r}/models/{mlId}/tags`.
+        - `serving` — deployments; uses `serving/{id}/tags`.
+        - `apps` or `jobs` — jobs/apps; uses `apps/{name}/tags` (or `jobs/{name}/tags`).
 
         Parameters:
-            feature_store_id: id of the respective featurestore
-            entity_type: "trainingdatasets" or "featuregroups"
+            feature_store_id: id of the respective featurestore, or `None` for non-FS assets.
+            entity_type: one of the supported entity types above.
         """
         self._feature_store_id = feature_store_id
         self._entity_type = entity_type
@@ -126,6 +132,36 @@ class TagsApi:
     @usage.method_logger
     def get_path(self, metadata_instance, training_dataset_version=None):
         _client = client.get_instance()
+        if self._entity_type == "models":
+            return [
+                "project",
+                _client._project_id,
+                "modelregistries",
+                getattr(
+                    metadata_instance,
+                    "model_registry_id",
+                    _client._project_id,
+                ),
+                "models",
+                self._model_ml_id(metadata_instance),
+                "tags",
+            ]
+        if self._entity_type == "serving":
+            return [
+                "project",
+                _client._project_id,
+                "serving",
+                metadata_instance.id,
+                "tags",
+            ]
+        if self._entity_type in ("apps", "jobs"):
+            return [
+                "project",
+                _client._project_id,
+                self._entity_type,
+                metadata_instance.name,
+                "tags",
+            ]
         if hasattr(metadata_instance, "training_data"):
             # Only FeatureView has training_data method
             path = [
@@ -155,3 +191,13 @@ class TagsApi:
             metadata_instance.id,
             "tags",
         ]
+
+    @staticmethod
+    def _model_ml_id(model) -> str:
+        # Server identifies a model version by mlId = "{name}_{version}".
+        # Accept either an explicit attribute or fall back to building it.
+        if hasattr(model, "mlId") and model.mlId:
+            return model.mlId
+        if hasattr(model, "ml_id") and model.ml_id:
+            return model.ml_id
+        return f"{model.name}_{model.version}"

@@ -25,6 +25,7 @@ from hopsworks_apigen import public
 from hopsworks_common import client, usage, util
 from hopsworks_common.client.exceptions import JobExecutionException
 from hopsworks_common.core import app_api
+from hopsworks_common.core.tags_api import TagsApi
 
 
 _logger = logging.getLogger(__name__)
@@ -244,6 +245,61 @@ class App:
         """
         _logger.info("Deleting app: %s", self._name)
         self._app_api._delete(self._name)
+
+    @public
+    @usage.method_logger
+    def add_tag(self, name: str, value):
+        """Attach a tag to this app.
+
+        Tag names are unique cluster-wide.
+        The value can be any JSON-encodable scalar, list, or dict.
+
+        Parameters:
+            name: Tag name to add.
+            value: Tag value to add.
+
+        Raises:
+            hopsworks.client.exceptions.RestAPIError: If the backend rejects the tag.
+        """
+        self._tags_api().add(self, name, value)
+
+    @public
+    @usage.method_logger
+    def delete_tag(self, name: str):
+        """Delete a tag attached to this app.
+
+        Parameters:
+            name: Tag name to remove.
+
+        Raises:
+            hopsworks.client.exceptions.RestAPIError: If the backend cannot delete the tag.
+        """
+        self._tags_api().delete(self, name)
+
+    @public
+    def get_tag(self, name: str):
+        """Get a single tag attached to this app.
+
+        Parameters:
+            name: Tag name.
+
+        Returns:
+            The tag value, or `None` if the tag is not set.
+        """
+        tags = self._tags_api().get(self, name)
+        return tags.get(name)
+
+    @public
+    def get_tags(self) -> dict:
+        """Get all tags attached to this app.
+
+        Returns:
+            A dictionary mapping tag name to value.
+        """
+        return self._tags_api().get(self)
+
+    def _tags_api(self) -> TagsApi:
+        return TagsApi(feature_store_id=None, entity_type="apps")
 
     @public
     @usage.method_logger

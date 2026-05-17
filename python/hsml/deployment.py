@@ -22,6 +22,7 @@ from hopsworks_common.client.exceptions import ModelServingException
 from hsml import predictor as predictor_mod
 from hsml.constants import DEPLOYABLE_COMPONENT, PREDICTOR_STATE
 from hsml.core import model_api, serving_api
+from hopsworks_common.core.tags_api import TagsApi
 from hsml.engine import serving_engine
 
 
@@ -507,6 +508,62 @@ class Deployment:
             ```
         """
         return self._predictor.get_inference_url()
+
+    @public
+    @usage.method_logger
+    def add_tag(self, name: str, value):
+        """Attach a tag to a deployment.
+
+        A tag consists of a `name`/`value` pair.
+        Tag names are unique identifiers across the cluster.
+        The value can be any valid JSON — primitive, array, or object.
+
+        Parameters:
+            name: Name of the tag to add.
+            value: Value of the tag to add (will be JSON-encoded).
+
+        Raises:
+            hopsworks.client.exceptions.RestAPIError: in case the backend fails to add the tag.
+        """
+        self._tags_api().add(self, name, value)
+
+    @public
+    @usage.method_logger
+    def delete_tag(self, name: str):
+        """Delete a tag attached to a deployment.
+
+        Parameters:
+            name: Name of the tag to remove.
+
+        Raises:
+            hopsworks.client.exceptions.RestAPIError: in case the backend fails to delete the tag.
+        """
+        self._tags_api().delete(self, name)
+
+    @public
+    def get_tag(self, name: str):
+        """Get a single tag attached to a deployment.
+
+        Parameters:
+            name: Name of the tag.
+
+        Returns:
+            The tag value, or `None` if the tag is not set.
+        """
+        tags = self._tags_api().get(self, name)
+        return tags.get(name)
+
+    @public
+    def get_tags(self) -> dict:
+        """Get all tags attached to a deployment.
+
+        Returns:
+            A dictionary mapping tag name to value.
+        """
+        return self._tags_api().get(self)
+
+    def _tags_api(self) -> TagsApi:
+        return TagsApi(feature_store_id=None, entity_type="serving")
 
     @public
     def describe(self):
