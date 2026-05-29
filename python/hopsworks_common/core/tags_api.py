@@ -30,12 +30,12 @@ if TYPE_CHECKING:
 
 @also_available_as("hopsworks.core.tags_api.TagsApi", "hsfs.core.tags_api.TagsApi")
 class TagsApi:
-    def __init__(self, feature_store_id: int, entity_type: str):
-        """Tags endpoint for `trainingdatasets` and `featuregroups` resource.
+    def __init__(self, feature_store_id: int | None, entity_type: str):
+        """Tags endpoint for the supported asset types.
 
         Parameters:
-            feature_store_id: id of the respective featurestore
-            entity_type: "trainingdatasets" or "featuregroups"
+            feature_store_id: id of the respective featurestore, or None for non-FS assets.
+            entity_type: one of "trainingdatasets", "featuregroups", "models", "serving", "jobs", "apps".
         """
         self._feature_store_id = feature_store_id
         self._entity_type = entity_type
@@ -126,6 +126,40 @@ class TagsApi:
     @usage.method_logger
     def get_path(self, metadata_instance, training_dataset_version=None):
         _client = client.get_instance()
+        if self._entity_type == "models":
+            return [
+                "project",
+                _client._project_id,
+                "modelregistries",
+                str(metadata_instance.model_registry_id),
+                "models",
+                metadata_instance.id,
+                "tags",
+            ]
+        if self._entity_type == "serving":
+            return [
+                "project",
+                _client._project_id,
+                "serving",
+                metadata_instance.id,
+                "tags",
+            ]
+        if self._entity_type == "jobs":
+            return [
+                "project",
+                _client._project_id,
+                "jobs",
+                metadata_instance.name,
+                "tags",
+            ]
+        if self._entity_type == "apps":
+            return [
+                "project",
+                _client._project_id,
+                "apps",
+                metadata_instance.name,
+                "tags",
+            ]
         if hasattr(metadata_instance, "training_data"):
             # Only FeatureView has training_data method
             path = [

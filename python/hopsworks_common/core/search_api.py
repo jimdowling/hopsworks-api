@@ -23,17 +23,27 @@ from urllib.parse import quote
 from hopsworks_apigen import public
 from hopsworks_common import client
 from hopsworks_common.search_results import (
+    DeploymentSearchResult,
     FeatureGroupSearchResult,
     FeatureSearchResult,
     FeaturestoreSearchResult,
     FeatureViewSearchResult,
+    JobSearchResult,
+    ModelSearchResult,
     TrainingDatasetSearchResult,
 )
 from hopsworks_common.util import Encoder
 
 
 DOC_TYPE_ARG = Literal[
-    "FEATUREGROUP", "FEATUREVIEW", "TRAININGDATASET", "FEATURE", "ALL"
+    "FEATUREGROUP",
+    "FEATUREVIEW",
+    "TRAININGDATASET",
+    "FEATURE",
+    "MODEL",
+    "DEPLOYMENT",
+    "JOB",
+    "ALL",
 ]
 
 
@@ -154,6 +164,8 @@ class SearchApi:
         offset: int = 0,
         limit: int = 100,
         global_search: bool = False,
+        doc_type: DOC_TYPE_ARG = "ALL",
+        job_type: str | None = None,
     ) -> FeaturestoreSearchResult:
         """Search for feature groups, feature views, training datasets and features.
 
@@ -235,13 +247,14 @@ class SearchApi:
             ```
         """
         return self._search(
-            doc_type="ALL",
+            doc_type=doc_type,
             search_term=search_term,
             keyword_filter=keyword_filter,
             tag_filter=tag_filter,
             offset=offset,
             limit=limit,
             global_search=global_search,
+            job_type=job_type,
         )
 
     @public
@@ -493,6 +506,111 @@ class SearchApi:
         )
         return result.features
 
+    @public
+    def models(
+        self,
+        search_term: str | None = None,
+        keyword_filter: str | list[str] | None = None,
+        tag_filter: dict[str, str]
+        | list[dict[str, str] | TagSearchFilter]
+        | None = None,
+        offset: int = 0,
+        limit: int = 100,
+        global_search: bool = False,
+    ) -> list[ModelSearchResult]:
+        """Search for Models only."""
+        result = self._search(
+            doc_type="MODEL",
+            search_term=search_term,
+            keyword_filter=keyword_filter,
+            tag_filter=tag_filter,
+            offset=offset,
+            limit=limit,
+            global_search=global_search,
+        )
+        return result.models
+
+    @public
+    def deployments(
+        self,
+        search_term: str | None = None,
+        keyword_filter: str | list[str] | None = None,
+        tag_filter: dict[str, str]
+        | list[dict[str, str] | TagSearchFilter]
+        | None = None,
+        offset: int = 0,
+        limit: int = 100,
+        global_search: bool = False,
+    ) -> list[DeploymentSearchResult]:
+        """Search for Deployments only."""
+        result = self._search(
+            doc_type="DEPLOYMENT",
+            search_term=search_term,
+            keyword_filter=keyword_filter,
+            tag_filter=tag_filter,
+            offset=offset,
+            limit=limit,
+            global_search=global_search,
+        )
+        return result.deployments
+
+    @public
+    def jobs(
+        self,
+        search_term: str | None = None,
+        keyword_filter: str | list[str] | None = None,
+        tag_filter: dict[str, str]
+        | list[dict[str, str] | TagSearchFilter]
+        | None = None,
+        offset: int = 0,
+        limit: int = 100,
+        global_search: bool = False,
+        job_type: str | None = None,
+    ) -> list[JobSearchResult]:
+        """Search for Jobs (any JobType, including PYTHON_APP).
+
+        Pass ``job_type="PYTHON_APP"`` to restrict to Streamlit / Python apps; that is the
+        same filter that the Apps tab in the UI applies on top of the JOB doc type.
+        """
+        result = self._search(
+            doc_type="JOB",
+            search_term=search_term,
+            keyword_filter=keyword_filter,
+            tag_filter=tag_filter,
+            offset=offset,
+            limit=limit,
+            global_search=global_search,
+            job_type=job_type,
+        )
+        return result.jobs
+
+    @public
+    def apps(
+        self,
+        search_term: str | None = None,
+        keyword_filter: str | list[str] | None = None,
+        tag_filter: dict[str, str]
+        | list[dict[str, str] | TagSearchFilter]
+        | None = None,
+        offset: int = 0,
+        limit: int = 100,
+        global_search: bool = False,
+    ) -> list[JobSearchResult]:
+        """Search for Apps only.
+
+        Convenience over ``jobs(job_type="PYTHON_APP")``: same backing index/data, narrowed to
+        Streamlit / Python-app jobs.
+        """
+        return self.jobs(
+            search_term=search_term,
+            keyword_filter=keyword_filter,
+            tag_filter=tag_filter,
+            offset=offset,
+            limit=limit,
+            global_search=global_search,
+            job_type="PYTHON_APP",
+        )
+
     def _parse_keyword_filter(
         self, keyword_filter: str | list[str] | None
     ) -> list[KeywordSearchFilter] | None:
@@ -572,6 +690,7 @@ class SearchApi:
         offset: int | None = None,
         limit: int | None = None,
         global_search: bool = False,
+        job_type: str | None = None,
     ) -> FeaturestoreSearchResult:
         if doc_type not in get_args(DOC_TYPE_ARG):
             raise ValueError(
@@ -601,6 +720,11 @@ class SearchApi:
             "from": offset,
             "size": limit,
         }
+
+        # job_type narrows JOB doc-type results (e.g. "PYTHON_APP" for the Apps preset). The
+        # backend ignores it for other doc types.
+        if job_type is not None:
+            query_params["jobType"] = job_type
 
         if search_term is not None:
             query_params["searchTerm"] = search_term

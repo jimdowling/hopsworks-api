@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from hopsworks_apigen import public
 from hopsworks_common import client, usage, util
+from hopsworks_common.core import tags_api
 from hsml import predictor as predictor_mod
 from hsml.client.exceptions import ModelServingException
 from hsml.constants import DEPLOYABLE_COMPONENT, PREDICTOR_STATE
@@ -72,6 +73,7 @@ class Deployment:
         self._serving_api = serving_api.ServingApi()
         self._serving_engine = serving_engine.ServingEngine()
         self._model_api = model_api.ModelApi()
+        self._tags_api = tags_api.TagsApi(feature_store_id=None, entity_type="serving")
         self._grpc_channel = None
         self._model_registry_id = None
 
@@ -408,6 +410,47 @@ class Deployment:
             timeout=timeout,
             stop_on_status=stop_on_status,
         )
+
+    @public
+    @usage.method_logger
+    def add_tag(self, name: str, value: str | dict):
+        """Attach a tag to this deployment.
+
+        A tag is a name/value pair where names are unique cluster-wide and the value can be any
+        valid JSON. Tags are searchable in the project search.
+
+        Parameters:
+            name: Name of the tag schema.
+            value: Value to set for the tag.
+        """
+        self._tags_api.add(self, name, value)
+
+    @public
+    @usage.method_logger
+    def delete_tag(self, name: str):
+        """Delete a tag attached to this deployment.
+
+        Parameters:
+            name: Name of the tag to remove.
+        """
+        self._tags_api.delete(self, name)
+
+    @public
+    def get_tag(self, name: str):
+        """Get a single tag attached to this deployment by name.
+
+        Parameters:
+            name: Name of the tag to retrieve.
+
+        Returns:
+            Tag value, or `None` if no such tag exists.
+        """
+        return self._tags_api.get(self, name).get(name)
+
+    @public
+    def get_tags(self) -> dict:
+        """Retrieve all tags attached to this deployment as a name to value mapping."""
+        return self._tags_api.get(self)
 
     @public
     def get_url(self):

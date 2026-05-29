@@ -27,6 +27,7 @@ from hopsworks_apigen import public
 from hopsworks_common import client, usage, util
 from hopsworks_common.constants import INFERENCE_ENDPOINTS as IE
 from hopsworks_common.constants import MODEL_REGISTRY
+from hopsworks_common.core import tags_api
 from hsml.core import explicit_provenance
 from hsml.engine import model_engine
 from hsml.model_schema import ModelSchema
@@ -103,6 +104,10 @@ class Model:
         self._model_registry_id = model_registry_id
 
         self._model_engine = model_engine.ModelEngine()
+        # Unified tag client. Routes through the same /modelregistries/{r}/models/{id}/tags
+        # endpoint that ModelRegistryTagResource exposes — same URL contract, just consolidated
+        # behind the shared TagsApi so deployment/job/app tags share the implementation.
+        self._tags_api = tags_api.TagsApi(feature_store_id=None, entity_type="models")
         self._feature_view = feature_view
         self._training_dataset_version = training_dataset_version
 
@@ -305,7 +310,7 @@ class Model:
         Raises:
             hopsworks.client.exceptions.RestAPIError: in case the backend fails to add the tag.
         """
-        self._model_engine.set_tag(model_instance=self, name=name, value=value)
+        self._tags_api.add(self, name, value)
 
     @public
     @usage.method_logger
@@ -321,7 +326,7 @@ class Model:
             DeprecationWarning,
             stacklevel=2,
         )
-        self._model_engine.set_tag(model_instance=self, name=name, value=value)
+        self._tags_api.add(self, name, value)
 
     @public
     @usage.method_logger
@@ -334,7 +339,7 @@ class Model:
         Raises:
             hopsworks.client.exceptions.RestAPIError: in case the backend fails to delete the tag.
         """
-        self._model_engine.delete_tag(model_instance=self, name=name)
+        self._tags_api.delete(self, name)
 
     @public
     def get_tag(self, name: str) -> str | None:
@@ -349,7 +354,7 @@ class Model:
         Raises:
             hopsworks.client.exceptions.RestAPIError: in case the backend fails to retrieve the tag.
         """
-        return self._model_engine.get_tag(model_instance=self, name=name)
+        return self._tags_api.get(self, name).get(name)
 
     @public
     def get_tags(self) -> dict[str, tag.Tag]:
@@ -361,7 +366,7 @@ class Model:
         Raises:
             hopsworks.client.exceptions.RestAPIError: In case of a server error.
         """
-        return self._model_engine.get_tags(model_instance=self)
+        return self._tags_api.get(self)
 
     @public
     def get_url(self):

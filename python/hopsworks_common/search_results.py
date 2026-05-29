@@ -333,6 +333,21 @@ class FeatureSearchResult(SearchResultItem):
     """Search result for a Feature."""
 
 
+@public("hopsworks.core.search_api.ModelSearchResult")
+class ModelSearchResult(SearchResultItem):
+    """Search result for a Model version."""
+
+
+@public("hopsworks.core.search_api.DeploymentSearchResult")
+class DeploymentSearchResult(SearchResultItem):
+    """Search result for a Deployment."""
+
+
+@public("hopsworks.core.search_api.JobSearchResult")
+class JobSearchResult(SearchResultItem):
+    """Search result for a Job (any type, including PYTHON_APP / Streamlit apps)."""
+
+
 @public("hopsworks.core.search_api.FeaturestoreSearchResult")
 class FeaturestoreSearchResult:
     """Container for all featurestore search results."""
@@ -353,6 +368,13 @@ class FeaturestoreSearchResult:
         self._features = [
             FeatureSearchResult(f) for f in response_data.get("features", [])
         ]
+        self._models = [
+            ModelSearchResult(m) for m in response_data.get("models", [])
+        ]
+        self._deployments = [
+            DeploymentSearchResult(d) for d in response_data.get("deployments", [])
+        ]
+        self._jobs = [JobSearchResult(j) for j in response_data.get("jobs", [])]
 
         # Store metadata about result counts
         self._feature_groups_offset = response_data.get("featuregroupsFrom", 0)
@@ -363,6 +385,12 @@ class FeaturestoreSearchResult:
         self._training_datasets_total = response_data.get("trainingdatasetsTotal", 0)
         self._features_offset = response_data.get("featuresFrom", 0)
         self._features_total = response_data.get("featuresTotal", 0)
+        self._models_offset = response_data.get("modelsFrom", 0)
+        self._models_total = response_data.get("modelsTotal", 0)
+        self._deployments_offset = response_data.get("deploymentsFrom", 0)
+        self._deployments_total = response_data.get("deploymentsTotal", 0)
+        self._jobs_offset = response_data.get("jobsFrom", 0)
+        self._jobs_total = response_data.get("jobsTotal", 0)
 
     @public
     @property
@@ -436,6 +464,42 @@ class FeaturestoreSearchResult:
         """Total number of Features matching the search."""
         return self._features_total
 
+    @public
+    @property
+    def models(self) -> list[ModelSearchResult]:
+        """List of Model search results."""
+        return self._models
+
+    @public
+    @property
+    def deployments(self) -> list[DeploymentSearchResult]:
+        """List of Deployment search results."""
+        return self._deployments
+
+    @public
+    @property
+    def jobs(self) -> list[JobSearchResult]:
+        """List of Job search results (includes PYTHON_APP / Streamlit apps)."""
+        return self._jobs
+
+    @public
+    @property
+    def models_total(self) -> int:
+        """Total number of Models matching the search."""
+        return self._models_total
+
+    @public
+    @property
+    def deployments_total(self) -> int:
+        """Total number of Deployments matching the search."""
+        return self._deployments_total
+
+    @public
+    @property
+    def jobs_total(self) -> int:
+        """Total number of Jobs matching the search."""
+        return self._jobs_total
+
     def json(self) -> dict:
         """Convert to JSON-serializable dictionary.
 
@@ -455,6 +519,15 @@ class FeaturestoreSearchResult:
             "features": [f.json() for f in self._features],
             "featuresFrom": self._features_offset,
             "featuresTotal": self._features_total,
+            "models": [m.json() for m in self._models],
+            "modelsFrom": self._models_offset,
+            "modelsTotal": self._models_total,
+            "deployments": [d.json() for d in self._deployments],
+            "deploymentsFrom": self._deployments_offset,
+            "deploymentsTotal": self._deployments_total,
+            "jobs": [j.json() for j in self._jobs],
+            "jobsFrom": self._jobs_offset,
+            "jobsTotal": self._jobs_total,
         }
 
     def __repr__(self):
@@ -463,5 +536,8 @@ class FeaturestoreSearchResult:
             f"feature_groups={len(self._feature_groups)}/{self._feature_groups_total}, "
             f"feature_views={len(self._feature_views)}/{self._feature_views_total}, "
             f"training_datasets={len(self._training_datasets)}/{self._training_datasets_total}, "
-            f"features={len(self._features)}/{self._features_total})"
+            f"features={len(self._features)}/{self._features_total}, "
+            f"models={len(self._models)}/{self._models_total}, "
+            f"deployments={len(self._deployments)}/{self._deployments_total}, "
+            f"jobs={len(self._jobs)}/{self._jobs_total})"
         )

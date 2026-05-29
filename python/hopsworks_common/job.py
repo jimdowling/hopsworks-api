@@ -25,7 +25,7 @@ import humps
 from hopsworks_apigen import public
 from hopsworks_common import alert, client, usage, util
 from hopsworks_common.client.exceptions import JobException
-from hopsworks_common.core import alerts_api, execution_api, job_api
+from hopsworks_common.core import alerts_api, execution_api, job_api, tags_api
 from hopsworks_common.engine import execution_engine
 from hopsworks_common.job_schedule import JobSchedule
 
@@ -74,6 +74,7 @@ class Job:
         self._execution_engine = execution_engine.ExecutionEngine()
         self._job_api = job_api.JobApi()
         self._alerts_api = alerts_api.AlertsApi()
+        self._tags_api = tags_api.TagsApi(feature_store_id=None, entity_type="jobs")
 
     @classmethod
     def from_response_json(cls, json_dict):
@@ -612,6 +613,47 @@ class Job:
 
     def __repr__(self) -> str:
         return f"Job({self._name!r}, {self._job_type!r})"
+
+    @public
+    @usage.method_logger
+    def add_tag(self, name: str, value: str | dict):
+        """Attach a tag to this job.
+
+        A tag is a name/value pair where names are unique cluster-wide and the value can be any
+        valid JSON. Tags are searchable in the project search.
+
+        Parameters:
+            name: Name of the tag schema.
+            value: Value to set for the tag.
+        """
+        self._tags_api.add(self, name, value)
+
+    @public
+    @usage.method_logger
+    def delete_tag(self, name: str):
+        """Delete a tag attached to this job.
+
+        Parameters:
+            name: Name of the tag to remove.
+        """
+        self._tags_api.delete(self, name)
+
+    @public
+    def get_tag(self, name: str):
+        """Get a single tag attached to this job by name.
+
+        Parameters:
+            name: Name of the tag to retrieve.
+
+        Returns:
+            Tag value, or `None` if no such tag exists.
+        """
+        return self._tags_api.get(self, name).get(name)
+
+    @public
+    def get_tags(self) -> dict:
+        """Retrieve all tags attached to this job as a name to value mapping."""
+        return self._tags_api.get(self)
 
     @public
     def get_url(self):
