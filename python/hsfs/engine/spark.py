@@ -115,6 +115,7 @@ from hsfs.core import (
     dataset_api,
     delta_engine,
     hudi_engine,
+    iceberg_engine,
     kafka_engine,
     transformation_function_engine,
 )
@@ -335,6 +336,28 @@ class Engine:
             delta_fg_alias=delta_fg_alias,
             read_options=read_options,
             is_cdc_query=is_cdc_query,
+        )
+
+    def register_iceberg_temporary_table(
+        self,
+        iceberg_fg_alias: hudi_feature_group_alias.HudiFeatureGroupAlias,
+        feature_store_id: int,
+        feature_store_name: str,
+        read_options: dict[str, Any] | None,
+    ):
+        # Registers the current snapshot of an Iceberg feature group as a temp view via the Hopsworks
+        # Iceberg REST catalog. Wired here for the read path; the backend ConstructorController emitting
+        # Iceberg FG aliases into FsQuery is a follow-up (point-in-time/time-travel is not yet supported).
+        iceberg_engine_instance = iceberg_engine.IcebergEngine(
+            feature_store_id,
+            feature_store_name,
+            iceberg_fg_alias.feature_group,
+            self._spark_session,
+            self._spark_context,
+        )
+        iceberg_engine_instance.register_temporary_table(
+            iceberg_fg_alias.alias,
+            read_options=read_options,
         )
 
     def _return_dataframe_type(self, dataframe, dataframe_type):
@@ -693,6 +716,17 @@ class Engine:
                 None if self._is_connect else self._spark_context,
             )
             delta_engine_instance.save_delta_fg(
+                dataframe, write_options, validation_id, operation=operation
+            )
+        elif feature_group.time_travel_format == "ICEBERG":
+            iceberg_engine_instance = iceberg_engine.IcebergEngine(
+                feature_group.feature_store_id,
+                feature_group.feature_store_name,
+                feature_group,
+                self._spark_session,
+                None if self._is_connect else self._spark_context,
+            )
+            iceberg_engine_instance.save_iceberg_fg(
                 dataframe, write_options, validation_id, operation=operation
             )
         else:

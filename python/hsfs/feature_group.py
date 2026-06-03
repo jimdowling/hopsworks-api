@@ -3205,6 +3205,11 @@ class FeatureGroup(FeatureGroupBase):
         if time_travel_format is None:
             return "NONE"
         fmt = time_travel_format.upper()
+        valid = ("NONE", "HUDI", "DELTA", "ICEBERG")
+        if fmt not in valid:
+            raise FeatureStoreException(
+                f"Unknown time_travel_format '{time_travel_format}'. Expected one of {valid}."
+            )
         if fmt == "DELTA" and not FeatureGroup._has_deltalake():
             raise FeatureStoreException(
                 "Cannot use time_travel_format='DELTA': delta library is not installed."

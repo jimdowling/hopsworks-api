@@ -81,6 +81,7 @@ sqlalchemy-1 = [
     "sqlalchemy<2.0.0",
 ]
 great-expectations = ["great_expectations>=0.18.12,<=1.17.1"]
+iceberg = ["pyiceberg[pyarrow]>=0.9.0"]
 dev-no-opt = [
     "hopsworks[python,trino]",
     "pytest==7.4.4",
