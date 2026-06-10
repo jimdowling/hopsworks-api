@@ -127,11 +127,12 @@ def get_accessible_feature_stores(ctx: click.Context) -> list[Any]:
     if obj.get("all_fs") is not None:
         return obj["all_fs"]
     own = get_feature_store(ctx)
+    from hopsworks_common.client.exceptions import RestAPIError
     from hsfs.core.feature_store_api import FeatureStoreApi
 
     try:
-        stores = FeatureStoreApi().get_all()
-    except Exception:  # noqa: BLE001 - degrade to just the project store
+        stores = FeatureStoreApi()._get_all()
+    except RestAPIError:  # degrade to just the project store
         stores = [own]
     own_id = getattr(own, "id", None)
     ordered = [own] + [s for s in stores if getattr(s, "id", None) != own_id]
