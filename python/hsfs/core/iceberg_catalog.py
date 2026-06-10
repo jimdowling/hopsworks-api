@@ -32,7 +32,7 @@ REST_PATH = "/hopsworks-api/api/iceberg"
 
 def _endpoint_and_credentials() -> tuple[str, str, str]:
     """Resolve (rest_uri, api_key, project) from the active Hopsworks client."""
-    instance = client.get_instance()
+    instance = client._get_instance()
     host, _port = instance._get_host_port_pair()
     rest_uri = f"https://{host}{REST_PATH}"
     api_key = getattr(getattr(instance, "_auth", None), "_token", None)
@@ -52,10 +52,11 @@ def spark_catalog_options(
     The warehouse is the project name (the REST `/config` endpoint resolves the catalog prefix from
     it); authentication reuses the Hopsworks API key via the `ApiKey` Authorization header.
     """
-    resolved_uri, resolved_key, resolved_project = _endpoint_and_credentials()
-    rest_uri = rest_uri or resolved_uri
-    api_key = api_key or resolved_key
-    project = project or resolved_project
+    if not (rest_uri and api_key and project):
+        resolved_uri, resolved_key, resolved_project = _endpoint_and_credentials()
+        rest_uri = rest_uri or resolved_uri
+        api_key = api_key or resolved_key
+        project = project or resolved_project
     prefix = f"spark.sql.catalog.{SPARK_CATALOG_NAME}"
     options = {
         prefix: "org.apache.iceberg.spark.SparkCatalog",
@@ -106,10 +107,11 @@ def get_iceberg_rest_catalog(
             "get_iceberg_rest_catalog requires pyiceberg; install it with `pip install pyiceberg`."
         ) from e
 
-    resolved_uri, resolved_key, resolved_project = _endpoint_and_credentials()
-    rest_uri = rest_uri or resolved_uri
-    api_key = api_key or resolved_key
-    project = project or resolved_project
+    if not (rest_uri and api_key and project):
+        resolved_uri, resolved_key, resolved_project = _endpoint_and_credentials()
+        rest_uri = rest_uri or resolved_uri
+        api_key = api_key or resolved_key
+        project = project or resolved_project
 
     config = {
         "uri": rest_uri,

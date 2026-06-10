@@ -380,6 +380,11 @@ class FeatureGroupEngine(feature_group_base_engine.FeatureGroupBaseEngine):
                 spark_context,
             )
             return delta_engine_instance._delete_record(delete_df)
+        if feature_group.time_travel_format == "ICEBERG":
+            raise exceptions.FeatureStoreException(
+                "Record deletes are not yet supported for Iceberg feature groups. "
+                "Delete rows with an external Iceberg engine through the REST catalog instead."
+            )
         if spark_context is None:
             raise exceptions.FeatureStoreException(
                 "Hudi feature group deletes are not supported with Spark Connect. "
