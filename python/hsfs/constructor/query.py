@@ -28,6 +28,7 @@ from hsfs import engine, storage_connector, util
 from hsfs import feature_group as fg_mod
 from hsfs.constructor import join as join_module
 from hsfs.constructor.filter import Filter, Logic
+from hsfs.constructor.lookback import Lookback
 from hsfs.core import query_constructor_api, storage_connector_api
 from hsfs.decorators import typechecked
 
@@ -85,13 +86,16 @@ class Query:
         self._feature_store_name = feature_store_name
         self._feature_store_id = feature_store_id
         self._left_feature_group = left_feature_group
-        self._left_features = util.parse_features(left_features)
+        self._left_features = util._parse_features(left_features)
         self._left_feature_group_start_time = left_feature_group_start_time
         self._left_feature_group_end_time = left_feature_group_end_time
         self._joins = joins or []
         self._filter = Logic.from_response_json(filter)
         self._limit = limit
-        self._python_engine: bool = engine.get_type() == "python"
+        # Lookback configuration for the feature view's joins; set only on the
+        # root Query and emitted as the top-level `lookback` field on the wire.
+        self._lookback: Lookback | None = None
+        self._python_engine: bool = engine._get_type() == "python"
         self._query_constructor_api: query_constructor_api.QueryConstructorApi = (
             query_constructor_api.QueryConstructorApi()
         )
@@ -105,40 +109,48 @@ class Query:
         self._check_read_supported(online)
 
         if online:
-            fs_query = self._query_constructor_api.construct_query(self)
+            fs_query = self._query_constructor_api._construct_query(self)
             sql_query = self._to_string(fs_query, online)
-            online_conn = self._storage_connector_api.get_online_connector(
+            online_conn = self._storage_connector_api._get_online_connector(
                 self._feature_store_id
             )
         else:
             online_conn = None
 
-            if engine.get_instance().is_flyingduck_query_supported(self, read_options):
+            if engine._get_instance()._is_flyingduck_query_supported(
+                self, read_options
+            ):
                 # The FlyingDuck (Hopsworks Query Service) payload is build in the backend
-                sql_query = self._query_constructor_api.construct_query(self, hqs=True)
+                sql_query = self._query_constructor_api._construct_query(self, hqs=True)
             else:
-                fs_query = self._query_constructor_api.construct_query(self)
+                fs_query = self._query_constructor_api._construct_query(self)
                 sql_query = self._to_string(fs_query, online)
                 # Register on demand feature groups as temporary tables
                 if isinstance(self._left_feature_group, fg_mod.SpineGroup):
-                    fs_query.register_external(self._left_feature_group.dataframe)
+                    fs_query._register_external(self._left_feature_group.dataframe)
                 else:
-                    fs_query.register_external()
+                    fs_query._register_external()
 
                 # In delta cdc queries return duplicate rows for upserts with old and new values
                 # as well as deleted rows. To avoid this, we set is_cdc_query to True to filter out
                 # on the cdc metadata columns.
                 is_cdc_query = bool(self.left_feature_group_start_time)
 
-                # Register on hudi/delta feature groups as temporary tables
-                fs_query.register_delta_tables(
+                # Register on hudi/delta/iceberg feature groups as temporary tables
+                fs_query._register_delta_tables(
                     feature_store_id=self._feature_store_id,
                     feature_store_name=self._feature_store_name,
                     read_options=read_options,
                     is_cdc_query=is_cdc_query,
                 )
 
-                fs_query.register_hudi_tables(
+                fs_query._register_hudi_tables(
+                    self._feature_store_id,
+                    self._feature_store_name,
+                    read_options,
+                )
+
+                fs_query._register_iceberg_tables(
                     self._feature_store_id,
                     self._feature_store_name,
                     read_options,
@@ -328,7 +340,7 @@ class Query:
             )
         self._check_read_supported(online)
         if online and self._left_feature_group.embedding_index:
-            return engine.get_instance().read_vector_db(
+            return engine._get_instance()._read_vector_db(
                 self._left_feature_group,
                 dataframe_type=dataframe_type,
                 filter=self._filter,
@@ -351,7 +363,7 @@ class Query:
                     "Pandas types casting only supported for feature_group.read()/query.select_all()"
                 )
 
-        return engine.get_instance().sql(
+        return engine._get_instance()._sql(
             sql_query,
             self._feature_store_name,
             online_conn,
@@ -378,7 +390,7 @@ class Query:
         event_time_feature = self._left_feature_group.get_feature(
             self._left_feature_group.event_time
         )
-        time_filter = util.build_time_filter(event_time_feature, start_time, end_time)
+        time_filter = util._build_time_filter(event_time_feature, start_time, end_time)
         filtered_query = self.filter(time_filter)
         return filtered_query.read(
             online=online,
@@ -410,7 +422,7 @@ class Query:
         self._check_read_supported(online)
         read_options = {}
         if online and self._left_feature_group.embedding_index:
-            return engine.get_instance().read_vector_db(
+            return engine._get_instance()._read_vector_db(
                 self._left_feature_group, n, filter=self._filter
             )
         previous_limit = self._limit
@@ -419,7 +431,7 @@ class Query:
             sql_query, online_conn = self._prep_read(online, read_options)
         finally:
             self._limit = previous_limit
-        return engine.get_instance().show(
+        return engine._get_instance()._show(
             sql_query, self._feature_store_name, n, online_conn, read_options
         )
 
@@ -507,14 +519,14 @@ class Query:
 
         Example: Reading features at a specific point in time
             ```python
-            fs = connection.get_feature_store();
+            fs = project.get_feature_store()
             query = fs.get_feature_group("example_feature_group", 1).select_all()
             query.as_of("2020-10-20 07:34:11").read().show()
             ```
 
         Example: Reading commits incrementally between specified points in time
             ```python
-            fs = connection.get_feature_store();
+            fs = project.get_feature_store()
             query = fs.get_feature_group("example_feature_group", 1).select_all()
             query.as_of("2020-10-20 07:34:11", exclude_until="2020-10-19 07:34:11").read().show()
             ```
@@ -525,7 +537,7 @@ class Query:
 
         Example: Reading only the changes from a single commit
             ```python
-            fs = connection.get_feature_store();
+            fs = project.get_feature_store()
             query = fs.get_feature_group("example_feature_group", 1).select_all()
             query.as_of("2020-10-20 07:31:38", exclude_until="2020-10-20 07:31:37").read().show()
             ```
@@ -535,7 +547,7 @@ class Query:
 
         Example: Reading the latest state of features, excluding commits before a specified point in time
             ```python
-            fs = connection.get_feature_store();
+            fs = project.get_feature_store()
             query = fs.get_feature_group("example_feature_group", 1).select_all()
             query.as_of(None, exclude_until="2020-10-20 07:31:38").read().show()
             ```
@@ -575,9 +587,9 @@ class Query:
         Returns:
             The query object with the applied time travel condition.
         """
-        wallclock_timestamp = util.convert_event_time_to_timestamp(wallclock_time)
+        wallclock_timestamp = util._convert_event_time_to_timestamp(wallclock_time)
 
-        exclude_until_timestamp = util.convert_event_time_to_timestamp(exclude_until)
+        exclude_until_timestamp = util._convert_event_time_to_timestamp(exclude_until)
 
         for _join in self._joins:
             _join.query.left_feature_group_end_time = wallclock_timestamp
@@ -609,10 +621,10 @@ class Query:
         Returns:
             The query object with the applied time travel condition.
         """
-        self.left_feature_group_start_time = util.convert_event_time_to_timestamp(
+        self.left_feature_group_start_time = util._convert_event_time_to_timestamp(
             wallclock_start_time
         )
-        self.left_feature_group_end_time = util.convert_event_time_to_timestamp(
+        self.left_feature_group_end_time = util._convert_event_time_to_timestamp(
             wallclock_end_time
         )
         return self
@@ -677,7 +689,7 @@ class Query:
         """
         if self._filter is None:
             if isinstance(f, Filter):
-                self._filter = Logic.Single(left_f=f)
+                self._filter = Logic._Single(left_f=f)
             elif isinstance(f, Logic):
                 self._filter = f
             else:
@@ -710,7 +722,7 @@ class Query:
         return json.dumps(self, cls=util.Encoder)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "featureStoreName": self._feature_store_name,
             "featureStoreId": self._feature_store_id,
             "leftFeatureGroup": self._left_feature_group,
@@ -722,6 +734,9 @@ class Query:
             "limit": self._limit,
             "hiveEngine": self._python_engine,
         }
+        if self._lookback is not None:
+            payload["lookback"] = self._lookback.to_dict()
+        return payload
 
     @classmethod
     def from_response_json(cls, json_dict: dict[str, Any]) -> Query:
@@ -743,7 +758,7 @@ class Query:
             feature_group_obj = fg_mod.FeatureGroup.from_response_json(
                 feature_group_json
             )
-        return cls(
+        q = cls(
             left_feature_group=feature_group_obj,
             left_features=json_decamelized["left_features"],
             feature_store_name=json_decamelized.get("feature_store_name", None),
@@ -761,6 +776,11 @@ class Query:
             filter=json_decamelized.get("filter", None),
             limit=json_decamelized.get("limit", None),
         )
+        # Restore Lookback from the wire payload so cross-process consumers
+        # that reconstruct a Query from JSON keep the lookback. Local-process
+        # callers attach `_lookback` themselves after this method returns.
+        q._lookback = Lookback.from_response_json(json_decamelized.get("lookback"))
+        return q
 
     def _check_read_supported(self, online: bool) -> None:
         if not online:
@@ -828,7 +848,7 @@ class Query:
         Returns:
             The string representation of the Query.
         """
-        fs_query = self._query_constructor_api.construct_query(self)
+        fs_query = self._query_constructor_api._construct_query(self)
 
         return self._to_string(fs_query, online, arrow_flight)
 
@@ -844,7 +864,7 @@ class Query:
         return fs_query.query
 
     def __str__(self) -> str:
-        return self._query_constructor_api.construct_query(self)
+        return self._query_constructor_api._construct_query(self)
 
     def _get_signature(self, fs_query: FsQuery, asof: bool = False) -> str | None:
         if fs_query.pit_query is not None:
@@ -882,6 +902,21 @@ class Query:
         self._left_feature_group_end_time = left_feature_group_end_time
 
     @public
+    @property
+    def lookback(self) -> Lookback | None:
+        """Lookback configuration for the feature view's joins.
+
+        See [`FeatureGroupLookback`][hsfs.constructor.lookback.FeatureGroupLookback] and
+        [`Lookback`][hsfs.constructor.lookback.Lookback] for usage and
+        per-feature-group override semantics.
+        """
+        return self._lookback
+
+    @lookback.setter
+    def lookback(self, lookback: Lookback | None) -> None:
+        self._lookback = lookback
+
+    @public
     def append_feature(self, feature: str | Feature) -> Query:
         """Append a feature to the query.
 
@@ -891,7 +926,7 @@ class Query:
         Returns:
             The query object with the appended feature.
         """
-        feature = util.validate_feature(feature)
+        feature = util._validate_feature(feature)
 
         self._left_features.append(feature)
 

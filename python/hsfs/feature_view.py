@@ -34,6 +34,7 @@ from hopsworks_common.client.exceptions import FeatureStoreException
 from hopsworks_common.core import alerts_api
 from hopsworks_common.core.constants import HAS_NUMPY, HAS_POLARS
 from hsfs import (
+    engine,
     feature_group,
     storage_connector,
     tag,
@@ -45,6 +46,7 @@ from hsfs import (
 from hsfs import serving_key as skm
 from hsfs.constructor import filter, query
 from hsfs.constructor.filter import Filter, Logic
+from hsfs.constructor.lookback import FeatureGroupLookback, Lookback
 from hsfs.core import data_source as ds
 from hsfs.core import (
     explicit_provenance,
@@ -53,6 +55,7 @@ from hsfs.core import (
     feature_view_engine,
     job,
     statistics_engine,
+    transformation_execution_dag,
     transformation_function_engine,
     vector_server,
 )
@@ -240,6 +243,10 @@ class FeatureView:
 
         self._feature_logger = None
         self._serving_training_dataset_version = None
+        # Worker count for parallel transformation application, set by
+        # init_serving / init_batch_scoring and used as the default for
+        # get_feature_vector(s) / get_batch_data when they are not given one.
+        self._transformation_n_processes: int | None = None
 
         # Lazy initialization for column names used in feature logging.
         self.__label_column_names = None
@@ -248,6 +255,25 @@ class FeatureView:
         self.__required_serving_key_names = None
         self.__root_feature_group_event_time_column_name = None
         self.__extra_logging_column_names = None
+
+        self._on_demand_transformation_execution_graph: (
+            transformation_execution_dag.TransformationExecutionDAG | None
+        ) = None  # Initialized when the features are retrieved from the backend.
+
+        # The complete on-demand transformation chain as serialized by the
+        # backend. None until hydrated in from_response_json; while None the
+        # property falls back to reconstructing the list from per-feature
+        # attachments (older backends).
+        self.__on_demand_transformation_functions: (
+            list[TransformationFunction] | None
+        ) = None
+
+        # Building the DAG rejects a cyclic model-dependent configuration here, at
+        # construction. The schema is not known yet, so the name-ambiguity check
+        # runs when features arrive in from_response_json.
+        self._model_dependent_transformation_execution_graph: transformation_execution_dag.TransformationExecutionDAG = transformation_execution_dag.TransformationExecutionDAG(
+            self.transformation_functions,
+        )
 
     @public
     def get_last_accessed_training_dataset(self):
@@ -293,7 +319,7 @@ class FeatureView:
             util.JobWarning,
             stacklevel=2,
         )
-        self._feature_view_engine.delete(self.name, self.version, force)
+        self._feature_view_engine._delete(self.name, self.version, force)
 
     @public
     @staticmethod
@@ -364,10 +390,10 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request.
         """
-        return self._feature_view_engine.update(self)
+        return self._feature_view_engine._update(self)
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def init_serving(
         self,
         training_dataset_version: int | None = None,
@@ -379,6 +405,7 @@ class FeatureView:
         config_rest_client: dict[str, Any] | None = None,
         default_client: Literal["sql", "rest"] | None = None,
         feature_logger: FeatureLogger | None = None,
+        n_processes: int | None = None,
         **kwargs,
     ) -> None:
         """Initialise feature view to retrieve feature vector from online and offline feature store.
@@ -444,6 +471,9 @@ class FeatureView:
             feature_logger:
                 Custom feature logger which [`FeatureView.log`][hsfs.feature_view.FeatureView.log] uses to log feature vectors.
                 If provided, feature vectors will not be inserted to logging feature group automatically when `FeatureView.log` is called.
+            n_processes:
+                Number of worker processes used to apply transformation functions in parallel during serving.
+                When greater than one, the worker pool is pre-spawned here so the first `get_feature_vector(s)` call does not pay the spawn and engine-init latency.
         """
         # initiate batch scoring server
         # `training_dataset_version` should not be set if `None` otherwise backend will look up the td.
@@ -472,7 +502,7 @@ class FeatureView:
             )
 
         # initiate single vector server
-        self._vector_server.init_serving(
+        self._vector_server._init_serving(
             entity=self,
             external=external,
             inference_helper_columns=True,
@@ -503,6 +533,32 @@ class FeatureView:
             # reset feature logger in case init_serving is called again without feature logger
             self._feature_logger = None
 
+        # Set last: init_serving runs after its internal init_batch_scoring, so
+        # the serving worker count wins over the one that call recorded.
+        self._transformation_n_processes = n_processes
+        self._warmup_transformation_workers(n_processes)
+
+    def _warmup_transformation_workers(self, n_processes: int | None) -> None:
+        """Pre-spawn the transformation worker pool when parallel execution is requested.
+
+        Called from init_serving / init_batch_scoring so callers do not warm the
+        pool themselves. A no-op unless `n_processes` asks for parallelism, the
+        Python engine is in use (Spark pushes transformations down), and the
+        feature view actually has transformations to apply.
+        """
+        if (
+            n_processes is not None
+            and n_processes > 1
+            and engine._get_type() != "spark"
+            and (
+                self.transformation_functions
+                or self._on_demand_transformation_functions
+            )
+        ):
+            transformation_function_engine.TransformationFunctionEngine._warmup_online_workers(
+                n_processes
+            )
+
     @staticmethod
     def _sort_transformation_functions(
         transformation_functions: list[TransformationFunction],
@@ -523,6 +579,7 @@ class FeatureView:
     def init_batch_scoring(
         self,
         training_dataset_version: int | None = None,
+        n_processes: int | None = None,
     ) -> None:
         """Initialise feature view to retrieve feature vector from offline feature store.
 
@@ -543,11 +600,16 @@ class FeatureView:
 
         Parameters:
             training_dataset_version: Transformation statistics are fetched from training dataset and applied to the feature vector.
+            n_processes:
+                Number of worker processes used to apply transformation functions in parallel during batch scoring.
+                When greater than one, the worker pool is pre-spawned here so the first batch call does not pay the spawn and engine-init latency.
         """
         self._serving_training_dataset_version = training_dataset_version
-        self._batch_scoring_server.init_batch_scoring(
+        self._batch_scoring_server._init_batch_scoring(
             self, training_dataset_version=training_dataset_version
         )
+        self._transformation_n_processes = n_processes
+        self._warmup_transformation_workers(n_processes)
 
     @public
     def get_batch_query(
@@ -555,6 +617,7 @@ class FeatureView:
         start_time: str | int | datetime | date | None = None,
         end_time: str | int | datetime | date | None = None,
         extra_filter: filter.Filter | filter.Logic | None = None,
+        lookback: FeatureGroupLookback | Lookback | dict[str, Any] | None = None,
     ) -> str:
         """Get a query string of the batch query.
 
@@ -592,11 +655,16 @@ class FeatureView:
             extra_filter:
                 Additional filters to be applied to the batch query on top of any feature view or training dataset filters.
                 Filters are pushed down to the data layer and combined with existing filters using AND logic.
+            lookback:
+                Optional lookback window to bound the PIT join.
+                For one window across every feature group, pass a `FeatureGroupLookback` — e.g. `FeatureGroupLookback(key="PARTITION_KEY", start=date(2026, 5, 5), end=date(2026, 5, 17))` or its dict form `{"key": "PARTITION_KEY", "start": date(2026, 5, 5), "end": date(2026, 5, 17)}`.
+                For different windows per feature group, pass a `Lookback` — e.g. `Lookback(default=FeatureGroupLookback(...), feature_group_lookbacks={"dim_a": FeatureGroupLookback(...)})` or its dict form `{"default": {...}, "feature_group_lookbacks": {"dim_a": {...}}}`.
+                See [`FeatureGroupLookback`][hsfs.constructor.lookback.FeatureGroupLookback] and [`Lookback`][hsfs.constructor.lookback.Lookback] for accepted key values, validation rules, and per-FG key matching semantics.
 
         Returns:
             The batch query.
         """
-        return self._feature_view_engine.get_batch_query_string(
+        return self._feature_view_engine._get_batch_query_string(
             self,
             start_time,
             end_time,
@@ -606,6 +674,7 @@ class FeatureView:
                 else None
             ),
             extra_filter=extra_filter,
+            lookback=Lookback.from_user_input(lookback),
         )
 
     @public
@@ -623,6 +692,7 @@ class FeatureView:
         request_parameters: dict[str, Any] | None = None,
         transformation_context: dict[str, Any] = None,
         logging_data: bool = False,
+        n_processes: int | None = None,
     ) -> (
         list[Any]
         | pd.DataFrame
@@ -743,6 +813,11 @@ class FeatureView:
                 The logging metadata is available as part of an additional attribute `hopsworks_logging_metadata` of the returned object.
                 The logging metadata contains the untransformed features, transformed features, inference helpers, serving keys, request parameters and event time.
                 The feature vector object returned can be passed to `feature_view.log()` to log the feature vector along with all the logging metadata.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                When not set, the value passed to `init_serving` is used.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             Returned `list`, `pd.DataFrame`, `polars.DataFrame` or `np.ndarray` (the exact type dependends on `return_type`) contains feature values related to provided primary keys, ordered according to positions of this features in the feature view query.
@@ -753,10 +828,13 @@ class FeatureView:
         if not self._vector_server._serving_initialized:
             self.init_serving(external=external)
 
+        if n_processes is None:
+            n_processes = self._transformation_n_processes
+
         vector_db_features = None
         if self._vector_db_client:
             vector_db_features = self._get_vector_db_result(entry)
-        return self._vector_server.get_feature_vector(
+        return self._vector_server._get_feature_vector(
             entry=entry,
             return_type=return_type,
             passed_features=passed_features,
@@ -769,6 +847,7 @@ class FeatureView:
             request_parameters=request_parameters,
             transformation_context=transformation_context,
             logging_data=logging_data,
+            n_processes=n_processes,
         )
 
     @public
@@ -786,6 +865,7 @@ class FeatureView:
         request_parameters: list[dict[str, Any]] | None = None,
         transformation_context: dict[str, Any] = None,
         logging_data: bool = False,
+        n_processes: int | None = None,
     ) -> (
         list[list[Any]]
         | pd.DataFrame
@@ -903,6 +983,11 @@ class FeatureView:
                 The logging metadata is available as part of an additional attribute `hopsworks_logging_metadata` of the returned object.
                 The logging metadata contains the untransformed features, transformed features, inference helpers, serving keys, request parameters and event time.
                 The feature vector object returned can be passed to `feature_view.log()` to log the feature vectors along with all the logging metadata.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                When not set, the value passed to `init_serving` is used.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             Returned `list[list]`, `pd.DataFrame`, `polars.DataFrame` or `np.ndarray` (depending on the `return_type`) contains feature values related to provided primary keys, ordered according to positions of this features in the feature view query.
@@ -913,12 +998,15 @@ class FeatureView:
         if not self._vector_server._serving_initialized:
             self.init_serving(external=external, init_rest_client=force_rest_client)
 
+        if n_processes is None:
+            n_processes = self._transformation_n_processes
+
         vector_db_features = []
         if self._vector_db_client:
             for _entry in entry:
                 vector_db_features.append(self._get_vector_db_result(_entry))
 
-        return self._vector_server.get_feature_vectors(
+        return self._vector_server._get_feature_vectors(
             entries=entry,
             return_type=return_type,
             passed_features=passed_features,
@@ -931,6 +1019,7 @@ class FeatureView:
             request_parameters=request_parameters,
             transformation_context=transformation_context,
             logging_data=logging_data,
+            n_processes=n_processes,
         )
 
     @public
@@ -978,7 +1067,7 @@ class FeatureView:
         """
         if not self._vector_server._serving_initialized:
             self.init_serving(external=external, init_rest_client=force_rest_client)
-        return self._vector_server.get_inference_helper(
+        return self._vector_server._get_inference_helper(
             entry, return_type, force_rest_client, force_sql_client
         )
 
@@ -1035,7 +1124,7 @@ class FeatureView:
         """
         if self._vector_server is None:
             self.init_serving(external=external, init_rest_client=force_rest_client)
-        return self._vector_server.get_inference_helpers(
+        return self._vector_server._get_inference_helpers(
             entry, return_type, force_rest_client, force_sql_client
         )
 
@@ -1047,13 +1136,13 @@ class FeatureView:
             return {}
         result_vectors = {}
         for join_index, fg in self._vector_db_client.embedding_fg_by_join_index.items():
-            complete, fg_entry = self._vector_db_client.filter_entry_by_join_index(
+            complete, fg_entry = self._vector_db_client._filter_entry_by_join_index(
                 entry, join_index
             )
             if not complete:
                 # Not retrieving from vector db if entry is not completed
                 continue
-            vector_db_features = self._vector_db_client.read(
+            vector_db_features = self._vector_db_client._read(
                 fg.id,
                 fg.columns,
                 keys=fg_entry,
@@ -1130,7 +1219,7 @@ class FeatureView:
         """
         if self._vector_db_client is None:
             self.init_serving(external=external)
-        results = self._vector_db_client.find_neighbors(
+        results = self._vector_db_client._find_neighbors(
             embedding,
             feature=(feature if feature else None),
             k=k,
@@ -1139,7 +1228,7 @@ class FeatureView:
         if len(results) == 0:
             return []
 
-        return self._vector_server.get_feature_vectors(
+        return self._vector_server._get_feature_vectors(
             [self._extract_primary_key(res[1]) for res in results],
             return_type=return_type,
             vector_db_features=[res[1] for res in results],
@@ -1167,7 +1256,7 @@ class FeatureView:
         return {fg for fg in self.query.featuregroups if fg.embedding_index}
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def get_batch_data(
         self,
         start_time: str | int | datetime | date | None = None,
@@ -1184,6 +1273,8 @@ class FeatureView:
         transformation_context: dict[str, Any] = None,
         logging_data: bool = False,
         extra_filter: filter.Filter | filter.Logic | None = None,
+        lookback: FeatureGroupLookback | Lookback | dict[str, Any] | None = None,
+        n_processes: int | None = None,
         **kwargs,
     ) -> TrainingDatasetDataFrameTypes | HopsworksLoggingMetadataType:
         """Get a batch of data from an event time interval from the offline feature store.
@@ -1285,6 +1376,16 @@ class FeatureView:
             extra_filter:
                 Additional filters to be applied to the batch data on top of any feature view or training dataset filters.
                 Filters are pushed down to the data layer and combined with existing filters using AND logic.
+            lookback:
+                Optional lookback window to bound the PIT join.
+                For one window across every feature group, pass a `FeatureGroupLookback` — e.g. `FeatureGroupLookback(key="PARTITION_KEY", start=date(2026, 5, 5), end=date(2026, 5, 17))` or its dict form `{"key": "PARTITION_KEY", "start": date(2026, 5, 5), "end": date(2026, 5, 17)}`.
+                For different windows per feature group, pass a `Lookback` — e.g. `Lookback(default=FeatureGroupLookback(...), feature_group_lookbacks={"dim_a": FeatureGroupLookback(...)})` or its dict form `{"default": {...}, "feature_group_lookbacks": {"dim_a": {...}}}`.
+                See [`FeatureGroupLookback`][hsfs.constructor.lookback.FeatureGroupLookback] and [`Lookback`][hsfs.constructor.lookback.Lookback] for accepted key values, validation rules, and per-FG key matching semantics.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                When not set, the value passed to `init_batch_scoring` is used.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             DataFrame: The spark dataframe containing the feature data.
@@ -1297,12 +1398,15 @@ class FeatureView:
         if not self._batch_scoring_server._serving_initialized:
             self.init_batch_scoring()
 
-        return self._feature_view_engine.get_batch_data(
+        if n_processes is None:
+            n_processes = self._transformation_n_processes
+
+        return self._feature_view_engine._get_batch_data(
             self,
             start_time,
             end_time,
             self._batch_scoring_server.training_dataset_version,
-            self._batch_scoring_server._model_dependent_transformation_functions,
+            self._batch_scoring_server._model_dependent_transformation_functions_execution_graph,
             read_options,
             spine,
             kwargs.get("primary_keys") or primary_key,
@@ -1313,6 +1417,8 @@ class FeatureView:
             transformation_context=transformation_context,
             logging_data=logging_data,
             extra_filter=extra_filter,
+            lookback=Lookback.from_user_input(lookback),
+            n_processes=n_processes,
         )
 
     @public
@@ -1342,7 +1448,7 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request.
         """
-        return self._feature_view_engine.add_tag(self, name, value)
+        return self._feature_view_engine._add_tag(self, name, value)
 
     @public
     def get_tag(self, name: str) -> tag.Tag | None:
@@ -1369,7 +1475,7 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request.
         """
-        return self._feature_view_engine.get_tag(self, name)
+        return self._feature_view_engine._get_tag(self, name)
 
     @public
     def get_tags(self) -> dict[str, tag.Tag]:
@@ -1393,7 +1499,7 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request.
         """
-        return self._feature_view_engine.get_tags(self)
+        return self._feature_view_engine._get_tags(self)
 
     @public
     def get_parent_feature_groups(self) -> explicit_provenance.Links | None:
@@ -1410,7 +1516,7 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request
         """
-        return self._feature_view_engine.get_parent_feature_groups(self)
+        return self._feature_view_engine._get_parent_feature_groups(self)
 
     @public
     def get_newest_model(
@@ -1478,7 +1584,7 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request.
         """
-        return self._feature_view_engine.get_models_provenance(
+        return self._feature_view_engine._get_models_provenance(
             self, training_dataset_version=training_dataset_version
         )
 
@@ -1504,7 +1610,7 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request.
         """
-        return self._feature_view_engine.delete_tag(self, name)
+        return self._feature_view_engine._delete_tag(self, name)
 
     @public
     def update_last_accessed_training_dataset(self, version: int) -> None:
@@ -1520,7 +1626,7 @@ class FeatureView:
         self._last_accessed_training_dataset = version
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def create_training_data(
         self,
         start_time: str | int | datetime | date | None = "",
@@ -1538,6 +1644,7 @@ class FeatureView:
         transformation_context: dict[str, Any] = None,
         data_source: ds.DataSource | dict[str, Any] | None = None,
         tags: tag.Tag | dict[str, Any] | list[tag.Tag | dict[str, Any]] | None = None,
+        lookback: FeatureGroupLookback | Lookback | dict[str, Any] | None = None,
         **kwargs,
     ) -> tuple[int, job.Job]:
         """Create the metadata for a training dataset and save the corresponding training data into `location`.
@@ -1705,6 +1812,11 @@ class FeatureView:
                 The `context` variable must be explicitly defined as parameters in the transformation function for these to be accessible during execution.
             data_source: The data source specifying the location of the data. Overrides the storage_connector and location arguments when specified.
             tags: Tags to attach to the training dataset for better discoverability.
+            lookback:
+                Optional lookback window persisted with the training dataset so re-reading the same training-dataset version reconstructs the same per-join predicate.
+                For one window across every feature group, pass a `FeatureGroupLookback` — e.g. `FeatureGroupLookback(key="PARTITION_KEY", start=date(2026, 5, 5), end=date(2026, 5, 17))` or its dict form `{"key": "PARTITION_KEY", "start": date(2026, 5, 5), "end": date(2026, 5, 17)}`.
+                For different windows per feature group, pass a `Lookback` — e.g. `Lookback(default=FeatureGroupLookback(...), feature_group_lookbacks={"dim_a": FeatureGroupLookback(...)})` or its dict form `{"default": {...}, "feature_group_lookbacks": {"dim_a": {...}}}`.
+                See [`FeatureGroupLookback`][hsfs.constructor.lookback.FeatureGroupLookback] and [`Lookback`][hsfs.constructor.lookback.Lookback] for accepted key values, validation rules, and per-FG key matching semantics.
 
         Returns:
             td_version: training dataset version
@@ -1717,7 +1829,7 @@ class FeatureView:
             data_source = ds.DataSource(
                 storage_connector=storage_connector, path=location
             )
-        normalized_tags = tag.Tag.normalize(tags)
+        normalized_tags = tag.Tag._normalize(tags)
 
         td = training_dataset.TrainingDataset(
             name=self.name,
@@ -1736,12 +1848,13 @@ class FeatureView:
             tags=normalized_tags,
         )
         # td_job is used only if the python engine is used
-        td, td_job = self._feature_view_engine.create_training_dataset(
+        td, td_job = self._feature_view_engine._create_training_dataset(
             self,
             td,
             write_options or {},
             spine=spine,
             transformation_context=transformation_context,
+            lookback=Lookback.from_user_input(lookback),
         )
         warnings.warn(
             f"Incremented version to `{td.version}`.",
@@ -1753,7 +1866,7 @@ class FeatureView:
         return td.version, td_job
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def create_train_test_split(
         self,
         test_size: float | None = None,
@@ -1774,6 +1887,7 @@ class FeatureView:
         transformation_context: dict[str, Any] = None,
         data_source: ds.DataSource | dict[str, Any] | None = None,
         tags: tag.Tag | dict[str, Any] | list[tag.Tag | dict[str, Any]] | None = None,
+        lookback: FeatureGroupLookback | Lookback | dict[str, Any] | None = None,
         **kwargs,
     ) -> tuple[int, job.Job]:
         # TODO: Convert the docstrings from this point on:
@@ -1992,6 +2106,11 @@ class FeatureView:
                 The `context` variable must be explicitly defined as parameters in the transformation function for these to be accessible during execution. If no context variables are provided, this parameter defaults to `None`.
             data_source: The data source specifying the location of the data. Overrides the storage_connector and location arguments when specified.
             tags: Tags to attach to the training dataset for better discoverability.
+            lookback:
+                Optional lookback window persisted with the training dataset and applied to all splits.
+                For one window across every feature group, pass a `FeatureGroupLookback` — e.g. `FeatureGroupLookback(key="PARTITION_KEY", start=date(2026, 5, 5), end=date(2026, 5, 17))` or its dict form `{"key": "PARTITION_KEY", "start": date(2026, 5, 5), "end": date(2026, 5, 17)}`.
+                For different windows per feature group, pass a `Lookback` — e.g. `Lookback(default=FeatureGroupLookback(...), feature_group_lookbacks={"dim_a": FeatureGroupLookback(...)})` or its dict form `{"default": {...}, "feature_group_lookbacks": {"dim_a": {...}}}`.
+                See [`FeatureGroupLookback`][hsfs.constructor.lookback.FeatureGroupLookback] and [`Lookback`][hsfs.constructor.lookback.Lookback] for accepted key values, validation rules, and per-FG key matching semantics.
 
         Returns:
             td_version: The version of the created training dataset.
@@ -2007,7 +2126,7 @@ class FeatureView:
             data_source = ds.DataSource(
                 storage_connector=storage_connector, path=location
             )
-        normalized_tags = tag.Tag.normalize(tags)
+        normalized_tags = tag.Tag._normalize(tags)
 
         td = training_dataset.TrainingDataset(
             name=self.name,
@@ -2030,12 +2149,13 @@ class FeatureView:
             tags=normalized_tags,
         )
         # td_job is used only if the python engine is used
-        td, td_job = self._feature_view_engine.create_training_dataset(
+        td, td_job = self._feature_view_engine._create_training_dataset(
             self,
             td,
             write_options or {},
             spine=spine,
             transformation_context=transformation_context,
+            lookback=Lookback.from_user_input(lookback),
         )
         warnings.warn(
             f"Incremented version to `{td.version}`.",
@@ -2046,7 +2166,7 @@ class FeatureView:
         return td.version, td_job
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def create_train_validation_test_split(
         self,
         validation_size: float | None = None,
@@ -2070,6 +2190,7 @@ class FeatureView:
         transformation_context: dict[str, Any] = None,
         data_source: ds.DataSource | dict[str, Any] | None = None,
         tags: tag.Tag | dict[str, Any] | list[tag.Tag | dict[str, Any]] | None = None,
+        lookback: FeatureGroupLookback | Lookback | dict[str, Any] | None = None,
         **kwargs,
     ) -> tuple[int, job.Job]:
         """Create the metadata for a training dataset and save the corresponding training data into `location`.
@@ -2273,6 +2394,11 @@ class FeatureView:
                 The `context` variable must be explicitly defined as parameters in the transformation function for these to be accessible during execution. If no context variables are provided, this parameter defaults to `None`.
             data_source: The data source specifying the location of the data. Overrides the storage_connector and location arguments when specified.
             tags: Tags to attach to the training dataset for better discoverability.
+            lookback:
+                Optional lookback window persisted with the training dataset and applied to all splits.
+                For one window across every feature group, pass a `FeatureGroupLookback` — e.g. `FeatureGroupLookback(key="PARTITION_KEY", start=date(2026, 5, 5), end=date(2026, 5, 17))` or its dict form `{"key": "PARTITION_KEY", "start": date(2026, 5, 5), "end": date(2026, 5, 17)}`.
+                For different windows per feature group, pass a `Lookback` — e.g. `Lookback(default=FeatureGroupLookback(...), feature_group_lookbacks={"dim_a": FeatureGroupLookback(...)})` or its dict form `{"default": {...}, "feature_group_lookbacks": {"dim_a": {...}}}`.
+                See [`FeatureGroupLookback`][hsfs.constructor.lookback.FeatureGroupLookback] and [`Lookback`][hsfs.constructor.lookback.Lookback] for accepted key values, validation rules, and per-FG key matching semantics.
 
         Returns:
             td_version: The training dataset version.
@@ -2293,7 +2419,7 @@ class FeatureView:
             data_source = ds.DataSource(
                 storage_connector=storage_connector, path=location
             )
-        normalized_tags = tag.Tag.normalize(tags)
+        normalized_tags = tag.Tag._normalize(tags)
 
         td = training_dataset.TrainingDataset(
             name=self.name,
@@ -2319,12 +2445,13 @@ class FeatureView:
             tags=normalized_tags,
         )
         # td_job is used only if the python engine is used
-        td, td_job = self._feature_view_engine.create_training_dataset(
+        td, td_job = self._feature_view_engine._create_training_dataset(
             self,
             td,
             write_options or {},
             spine=spine,
             transformation_context=transformation_context,
+            lookback=Lookback.from_user_input(lookback),
         )
         warnings.warn(
             f"Incremented version to `{td.version}`.",
@@ -2336,7 +2463,7 @@ class FeatureView:
         return td.version, td_job
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def recreate_training_dataset(
         self,
         training_dataset_version: int,
@@ -2405,7 +2532,7 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request
         """
-        td, td_job = self._feature_view_engine.recreate_training_dataset(
+        td, td_job = self._feature_view_engine._recreate_training_dataset(
             self,
             training_dataset_version=training_dataset_version,
             statistics_config=statistics_config,
@@ -2418,7 +2545,7 @@ class FeatureView:
         return td_job
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def training_data(
         self,
         start_time: str | int | datetime | date | None = None,
@@ -2433,6 +2560,8 @@ class FeatureView:
         training_helper_columns: bool = False,
         dataframe_type: str | None = "default",
         transformation_context: dict[str, Any] = None,
+        lookback: FeatureGroupLookback | Lookback | dict[str, Any] | None = None,
+        n_processes: int | None = None,
         **kwargs,
     ) -> tuple[
         TrainingDatasetDataFrameTypes,
@@ -2534,6 +2663,15 @@ class FeatureView:
             transformation_context:
                 A dictionary mapping variable names to objects that will be provided as contextual information to the transformation function at runtime.
                 The `context` variable must be explicitly defined as parameters in the transformation function for these to be accessible during execution. If no context variables are provided, this parameter defaults to `None`.
+            lookback:
+                Optional lookback window applied to the PIT join before reading; bounds the rows each joined feature group contributes so the engine can prune partitions before opening files.
+                For one window across every feature group, pass a `FeatureGroupLookback` — e.g. `FeatureGroupLookback(key="PARTITION_KEY", start=date(2026, 5, 5), end=date(2026, 5, 17))` or its dict form `{"key": "PARTITION_KEY", "start": date(2026, 5, 5), "end": date(2026, 5, 17)}`.
+                For different windows per feature group, pass a `Lookback` — e.g. `Lookback(default=FeatureGroupLookback(...), feature_group_lookbacks={"dim_a": FeatureGroupLookback(...)})` or its dict form `{"default": {...}, "feature_group_lookbacks": {"dim_a": {...}}}`.
+                See [`FeatureGroupLookback`][hsfs.constructor.lookback.FeatureGroupLookback] and [`Lookback`][hsfs.constructor.lookback.Lookback] for accepted key values, validation rules, and per-FG key matching semantics.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             (X, y): Tuple of dataframe of features and labels. If there are no labels, y returns `None`.
@@ -2551,8 +2689,9 @@ class FeatureView:
             statistics_config=statistics_config,
             training_dataset_type=training_dataset.TrainingDataset.IN_MEMORY,
             extra_filter=extra_filter,
+            lookback=Lookback.from_user_input(lookback),
         )
-        td, df = self._feature_view_engine.get_training_data(
+        td, df = self._feature_view_engine._get_training_data(
             self,
             read_options,
             training_dataset_obj=td,
@@ -2562,6 +2701,7 @@ class FeatureView:
             training_helper_columns=training_helper_columns,
             dataframe_type=dataframe_type,
             transformation_context=transformation_context,
+            n_processes=n_processes,
         )
         warnings.warn(
             f"Incremented version to `{td.version}`.",
@@ -2572,7 +2712,7 @@ class FeatureView:
         return df
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def train_test_split(
         self,
         test_size: float | None = None,
@@ -2590,6 +2730,8 @@ class FeatureView:
         training_helper_columns: bool = False,
         dataframe_type: str | None = "default",
         transformation_context: dict[str, Any] = None,
+        lookback: FeatureGroupLookback | Lookback | dict[str, Any] | None = None,
+        n_processes: int | None = None,
         **kwargs,
     ) -> tuple[
         TrainingDatasetDataFrameTypes,
@@ -2703,6 +2845,15 @@ class FeatureView:
             transformation_context:
                 A dictionary mapping variable names to objects that will be provided as contextual information to the transformation function at runtime.
                 The `context` variable must be explicitly defined as parameters in the transformation function for these to be accessible during execution. If no context variables are provided, this parameter defaults to `None`.
+            lookback:
+                Optional lookback window applied to the PIT join before reading; bounds the rows each joined feature group contributes so the engine can prune partitions before opening files. The same window applies to both the train and test splits.
+                For one window across every feature group, pass a `FeatureGroupLookback` — e.g. `FeatureGroupLookback(key="PARTITION_KEY", start=date(2026, 5, 5), end=date(2026, 5, 17))` or its dict form `{"key": "PARTITION_KEY", "start": date(2026, 5, 5), "end": date(2026, 5, 17)}`.
+                For different windows per feature group, pass a `Lookback` — e.g. `Lookback(default=FeatureGroupLookback(...), feature_group_lookbacks={"dim_a": FeatureGroupLookback(...)})` or its dict form `{"default": {...}, "feature_group_lookbacks": {"dim_a": {...}}}`.
+                See [`FeatureGroupLookback`][hsfs.constructor.lookback.FeatureGroupLookback] and [`Lookback`][hsfs.constructor.lookback.Lookback] for accepted key values, validation rules, and per-FG key matching semantics.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             (X_train, X_test, y_train, y_test):
@@ -2728,8 +2879,9 @@ class FeatureView:
             statistics_config=statistics_config,
             training_dataset_type=training_dataset.TrainingDataset.IN_MEMORY,
             extra_filter=extra_filter,
+            lookback=Lookback.from_user_input(lookback),
         )
-        td, df = self._feature_view_engine.get_training_data(
+        td, df = self._feature_view_engine._get_training_data(
             self,
             read_options,
             training_dataset_obj=td,
@@ -2740,6 +2892,7 @@ class FeatureView:
             training_helper_columns=training_helper_columns,
             dataframe_type=dataframe_type,
             transformation_context=transformation_context,
+            n_processes=n_processes,
         )
         warnings.warn(
             f"Incremented version to `{td.version}`.",
@@ -2763,7 +2916,7 @@ class FeatureView:
             )
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def train_validation_test_split(
         self,
         validation_size: float | None = None,
@@ -2784,6 +2937,8 @@ class FeatureView:
         training_helper_columns: bool = False,
         dataframe_type: str | None = "default",
         transformation_context: dict[str, Any] = None,
+        lookback: FeatureGroupLookback | Lookback | dict[str, Any] | None = None,
+        n_processes: int | None = None,
         **kwargs,
     ) -> tuple[
         TrainingDatasetDataFrameTypes,
@@ -2912,6 +3067,15 @@ class FeatureView:
             transformation_context:
                 A dictionary mapping variable names to objects that will be provided as contextual information to the transformation function at runtime.
                 The `context` variable must be explicitly defined as parameters in the transformation function for these to be accessible during execution. If no context variables are provided, this parameter defaults to `None`.
+            lookback:
+                Optional lookback window applied to the PIT join before reading; bounds the rows each joined feature group contributes so the engine can prune partitions before opening files. The same window applies to all three splits.
+                For one window across every feature group, pass a `FeatureGroupLookback` — e.g. `FeatureGroupLookback(key="PARTITION_KEY", start=date(2026, 5, 5), end=date(2026, 5, 17))` or its dict form `{"key": "PARTITION_KEY", "start": date(2026, 5, 5), "end": date(2026, 5, 17)}`.
+                For different windows per feature group, pass a `Lookback` — e.g. `Lookback(default=FeatureGroupLookback(...), feature_group_lookbacks={"dim_a": FeatureGroupLookback(...)})` or its dict form `{"default": {...}, "feature_group_lookbacks": {"dim_a": {...}}}`.
+                See [`FeatureGroupLookback`][hsfs.constructor.lookback.FeatureGroupLookback] and [`Lookback`][hsfs.constructor.lookback.Lookback] for accepted key values, validation rules, and per-FG key matching semantics.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             (X_train, X_val, X_test, y_train, y_val, y_test):
@@ -2945,8 +3109,9 @@ class FeatureView:
             statistics_config=statistics_config,
             training_dataset_type=training_dataset.TrainingDataset.IN_MEMORY,
             extra_filter=extra_filter,
+            lookback=Lookback.from_user_input(lookback),
         )
-        td, df = self._feature_view_engine.get_training_data(
+        td, df = self._feature_view_engine._get_training_data(
             self,
             read_options,
             training_dataset_obj=td,
@@ -2961,6 +3126,7 @@ class FeatureView:
             training_helper_columns=training_helper_columns,
             dataframe_type=dataframe_type,
             transformation_context=transformation_context,
+            n_processes=n_processes,
         )
         warnings.warn(
             f"Incremented version to `{td.version}`.",
@@ -2992,7 +3158,7 @@ class FeatureView:
             )
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def get_training_data(
         self,
         training_dataset_version: int,
@@ -3002,6 +3168,7 @@ class FeatureView:
         training_helper_columns: bool = False,
         dataframe_type: str | None = "default",
         transformation_context: dict[str, Any] = None,
+        n_processes: int | None = None,
         **kwargs,
     ) -> tuple[
         TrainingDatasetDataFrameTypes,
@@ -3050,11 +3217,15 @@ class FeatureView:
                 A dictionary mapping variable names to objects that will be provided as contextual information to the transformation function at runtime.
                 The `context` variable must be explicitly defined as parameters in the transformation function for these to be accessible during execution.
                 If no context variables are provided, this parameter defaults to `None`.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             (X, y): Tuple of dataframe of features and labels
         """
-        td, df = self._feature_view_engine.get_training_data(
+        td, df = self._feature_view_engine._get_training_data(
             self,
             read_options,
             training_dataset_version=training_dataset_version,
@@ -3063,13 +3234,14 @@ class FeatureView:
             training_helper_columns=training_helper_columns,
             dataframe_type=dataframe_type,
             transformation_context=transformation_context,
+            n_processes=n_processes,
         )
         self.update_last_accessed_training_dataset(td.version)
-        util.check_missing_mandatory_tags(td.missing_mandatory_tags)
+        util._check_missing_mandatory_tags(td.missing_mandatory_tags)
         return df
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def get_train_test_split(
         self,
         training_dataset_version: int,
@@ -3079,6 +3251,7 @@ class FeatureView:
         training_helper_columns: bool = False,
         dataframe_type: str | None = "default",
         transformation_context: dict[str, Any] = None,
+        n_processes: int | None = None,
         **kwargs,
     ) -> tuple[
         TrainingDatasetDataFrameTypes,
@@ -3123,12 +3296,16 @@ class FeatureView:
             transformation_context:
                 A dictionary mapping variable names to objects that will be provided as contextual information to the transformation function at runtime.
                 The `context` variable must be explicitly defined as parameters in the transformation function for these to be accessible during execution. If no context variables are provided, this parameter defaults to `None`.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             (X_train, X_test, y_train, y_test):
                 Tuple of dataframe of features and labels
         """
-        td, df = self._feature_view_engine.get_training_data(
+        td, df = self._feature_view_engine._get_training_data(
             self,
             read_options,
             training_dataset_version=training_dataset_version,
@@ -3138,12 +3315,13 @@ class FeatureView:
             training_helper_columns=training_helper_columns,
             dataframe_type=dataframe_type,
             transformation_context=transformation_context,
+            n_processes=n_processes,
         )
         self.update_last_accessed_training_dataset(td.version)
         return df
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def get_train_validation_test_split(
         self,
         training_dataset_version: int,
@@ -3153,6 +3331,7 @@ class FeatureView:
         training_helper_columns: bool = False,
         dataframe_type: str = "default",
         transformation_context: dict[str, Any] = None,
+        n_processes: int | None = None,
         **kwargs,
     ) -> tuple[
         TrainingDatasetDataFrameTypes,
@@ -3199,12 +3378,16 @@ class FeatureView:
             transformation_context:
                 A dictionary mapping variable names to objects that will be provided as contextual information to the transformation function at runtime.
                 The `context` variable must be explicitly defined as parameters in the transformation function for these to be accessible during execution. If no context variables are provided, this parameter defaults to `None`.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             (X_train, X_val, X_test, y_train, y_val, y_test):
                 Tuple of dataframe of features and labels
         """
-        td, df = self._feature_view_engine.get_training_data(
+        td, df = self._feature_view_engine._get_training_data(
             self,
             read_options,
             training_dataset_version=training_dataset_version,
@@ -3218,12 +3401,13 @@ class FeatureView:
             training_helper_columns=training_helper_columns,
             dataframe_type=dataframe_type,
             transformation_context=transformation_context,
+            n_processes=n_processes,
         )
         self.update_last_accessed_training_dataset(td.version)
         return df
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def get_training_datasets(self) -> list[training_dataset.TrainingDatasetBase]:
         """Returns the metadata of all training datasets created with this feature view.
 
@@ -3245,16 +3429,16 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request
         """
-        tds = self._feature_view_engine.get_training_datasets(self)
+        tds = self._feature_view_engine._get_training_datasets(self)
         for td in tds:
-            util.check_missing_mandatory_tags(
+            util._check_missing_mandatory_tags(
                 td.missing_mandatory_tags,
                 message=f"Training dataset '{td.name}' version {td.version} has missing mandatory tags",
             )
         return tds
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def get_training_dataset_statistics(
         self,
         training_dataset_version: int,
@@ -3283,7 +3467,7 @@ class FeatureView:
         Returns:
             `Statistics`
         """
-        return self._statistics_engine.get(
+        return self._statistics_engine._get(
             self,
             training_dataset_version=training_dataset_version,
             before_transformation=before_transformation,
@@ -3291,7 +3475,7 @@ class FeatureView:
         )
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def add_training_dataset_tag(
         self,
         training_dataset_version: int,
@@ -3324,12 +3508,12 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request
         """
-        return self._feature_view_engine.add_tag(
+        return self._feature_view_engine._add_tag(
             self, name, value, training_dataset_version=training_dataset_version
         )
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def get_training_dataset_tag(
         self, training_dataset_version: int, name: str
     ) -> tag.Tag | None:
@@ -3360,12 +3544,12 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request
         """
-        return self._feature_view_engine.get_tag(
+        return self._feature_view_engine._get_tag(
             self, name, training_dataset_version=training_dataset_version
         )
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def get_training_dataset_tags(
         self, training_dataset_version: int
     ) -> dict[str, tag.Tag]:
@@ -3394,12 +3578,12 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request
         """
-        return self._feature_view_engine.get_tags(
+        return self._feature_view_engine._get_tags(
             self, training_dataset_version=training_dataset_version
         )
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def delete_training_dataset_tag(
         self, training_dataset_version: int, name: str
     ) -> None:
@@ -3427,12 +3611,12 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request
         """
-        return self._feature_view_engine.delete_tag(
+        return self._feature_view_engine._delete_tag(
             self, name, training_dataset_version=training_dataset_version
         )
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def purge_training_data(self, training_dataset_version: int) -> None:
         """Delete a training dataset (data only).
 
@@ -3456,12 +3640,12 @@ class FeatureView:
         """
         if self._last_accessed_training_dataset == training_dataset_version:
             self.update_last_accessed_training_dataset(None)
-        self._feature_view_engine.delete_training_dataset_only(
+        self._feature_view_engine._delete_training_dataset_only(
             self, training_data_version=training_dataset_version
         )
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def purge_all_training_data(self) -> None:
         """Delete all training datasets (data only).
 
@@ -3482,10 +3666,10 @@ class FeatureView:
         """
         if self._last_accessed_training_dataset is not None:
             self.update_last_accessed_training_dataset(None)
-        self._feature_view_engine.delete_training_dataset_only(self)
+        self._feature_view_engine._delete_training_dataset_only(self)
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def delete_training_dataset(self, training_dataset_version: int) -> None:
         """Delete a training dataset. This will delete both metadata and training data.
 
@@ -3511,12 +3695,12 @@ class FeatureView:
         """
         if self._last_accessed_training_dataset == training_dataset_version:
             self.update_last_accessed_training_dataset(None)
-        self._feature_view_engine.delete_training_data(
+        self._feature_view_engine._delete_training_data(
             self, training_data_version=training_dataset_version
         )
 
     @public
-    @usage.method_logger
+    @usage._method_logger
     def delete_all_training_datasets(self) -> None:
         """Delete all training datasets. This will delete both metadata and training data.
 
@@ -3537,7 +3721,110 @@ class FeatureView:
         """
         if self._last_accessed_training_dataset is not None:
             self.update_last_accessed_training_dataset(None)
-        self._feature_view_engine.delete_training_data(self)
+        self._feature_view_engine._delete_training_data(self)
+
+    @public
+    def visualize_transformations(
+        self,
+        kind: str = "all",
+        mode: str = "auto",
+        orient: str = "LR",
+    ) -> None:
+        """Visualize transformation function execution DAGs attached to this feature view.
+
+        Renders the transformation pipeline as a directed graph showing input features,
+        transformation functions, dependency edges with linking column names, and
+        output features. When ``kind="all"`` (the default), the model-dependent and
+        on-demand DAGs render sequentially, each under its own heading.
+
+        Example:
+            ```python
+            # get feature store instance
+            fs = ...
+
+            # get feature view instance
+            fv = fs.get_feature_view(...)
+
+            # visualize all transformations (renders inline in Jupyter)
+            fv.visualize_transformations()
+
+            # visualize only model-dependent transformations
+            fv.visualize_transformations(kind="model_dependent")
+
+            # force text output
+            fv.visualize_transformations(mode="text")
+            ```
+
+        Parameters:
+            kind: Which transformations to visualize. One of:
+                `"all"` (default) - both on-demand and model-dependent transformations,
+                `"on_demand"` - only on-demand transformations,
+                `"model_dependent"` - only model-dependent transformations.
+            mode: Display mode. One of `"auto"` (default), `"text"`, `"mermaid"`.
+            orient: Layout direction for the rendered flowchart. One of:
+                `"LR"` (left-to-right, default), `"TB"` (top-to-bottom),
+                `"BT"` (bottom-to-top), `"RL"` (right-to-left).
+
+        Raises:
+            `ValueError`: If `kind` is not one of `"all"`, `"on_demand"`, `"model_dependent"`.
+            `FeatureStoreException`: If the requested DAG is not available.
+        """
+        valid_kinds = ("all", "on_demand", "model_dependent")
+        if kind not in valid_kinds:
+            raise ValueError(f"Invalid kind '{kind}'. Must be one of {valid_kinds}.")
+
+        if kind == "on_demand":
+            if self._on_demand_transformation_execution_graph is None:
+                raise FeatureStoreException(
+                    "On-demand transformation execution graph is not available. "
+                    "Ensure features have been retrieved from the backend."
+                )
+            self._on_demand_transformation_execution_graph._visualize(
+                mode=mode, orient=orient
+            )
+            return
+
+        if kind == "model_dependent":
+            self._model_dependent_transformation_execution_graph._visualize(
+                mode=mode, orient=orient
+            )
+            return
+
+        # kind == "all": render each non-empty DAG under its own heading; each
+        # DAG renders itself, so empty ones are simply skipped.
+        md = self._model_dependent_transformation_execution_graph
+        od = self._on_demand_transformation_execution_graph
+        sections: list[
+            tuple[str, transformation_execution_dag.TransformationExecutionDAG]
+        ] = []
+        if md is not None and md.nodes:
+            sections.append(("Model-Dependent Transformations", md))
+        if od is not None and od.nodes:
+            sections.append(("On-Demand Transformations", od))
+
+        if not sections:
+            print("No transformation functions attached to this feature view.")
+            return
+
+        in_jupyter = (
+            transformation_execution_dag.TransformationExecutionDAG._in_jupyter()
+        )
+
+        if mode == "text" or (mode == "auto" and not in_jupyter):
+            for i, (title, dag) in enumerate(sections):
+                if i > 0:
+                    print()
+                print(title)
+                print(dag)
+            return
+
+        # Inline mode in Jupyter: emit a Markdown header per DAG, then let
+        # each DAG render its own Mermaid block.
+        from IPython.display import Markdown, display
+
+        for title, dag in sections:
+            display(Markdown(f"### {title}"))
+            dag._visualize(mode=mode, orient=orient)
 
     @public
     def get_feature_monitoring_configs(
@@ -3586,10 +3873,10 @@ class FeatureView:
         # TODO: Should this filter out scheduled statistics only configs?
         if not self._id:
             raise FeatureStoreException(
-                "Only Feature Group registered with Hopsworks can fetch feature monitoring configurations."
+                "Only Feature View registered with Hopsworks can fetch feature monitoring configurations."
             )
 
-        return self._feature_monitoring_config_engine.get_feature_monitoring_configs(
+        return self._feature_monitoring_config_engine._get_feature_monitoring_configs(
             name=name,
             feature_name=feature_name,
             config_id=config_id,
@@ -3609,7 +3896,7 @@ class FeatureView:
         Example:
             ```python3
             # fetch your feature view
-            fv = fs.get_feature_view(name="my_feature_group", version=1)
+            fv = fs.get_feature_view(name="my_feature_view", version=1)
             # fetch feature monitoring history for a given feature monitoring config
             fm_history = fv.get_feature_monitoring_history(
                 config_name="my_config",
@@ -3626,15 +3913,11 @@ class FeatureView:
 
         Parameters:
             config_name: The name of the feature monitoring config to fetch history for.
-                Defaults to None.
             config_id: The id of the feature monitoring config to fetch history for.
-                Defaults to None.
             start_time: The start date of the feature monitoring history to fetch.
-                Defaults to None.
             end_time: The end date of the feature monitoring history to fetch.
-                Defaults to None.
             with_statistics: Whether to include statistics in the feature monitoring history.
-                Defaults to True. If False, only metadata about the monitoring will be fetched.
+                If False, only metadata about the monitoring will be fetched.
 
         Raises:
             hopsworks.client.exceptions.RestAPIError: In case the backend encounters an issue
@@ -3650,7 +3933,7 @@ class FeatureView:
                 "Only Feature View registered with Hopsworks can fetch feature monitoring history."
             )
 
-        return self._feature_monitoring_result_engine.get_feature_monitoring_results(
+        return self._feature_monitoring_result_engine._get_feature_monitoring_results(
             config_name=config_name,
             config_id=config_id,
             start_time=start_time,
@@ -3659,26 +3942,24 @@ class FeatureView:
         )
 
     @public
-    def create_statistics_monitoring(
+    def create_scheduled_statistics(
         self,
         name: str,
-        feature_name: str | None = None,
+        feature_names: str | list[str] | None = None,
         description: str | None = None,
         start_date_time: int | str | datetime | date | pd.Timestamp | None = None,
         end_date_time: int | str | datetime | date | pd.Timestamp | None = None,
         cron_expression: str | None = "0 0 12 ? * * *",
     ) -> fmc.FeatureMonitoringConfig:
-        """Run a job to compute statistics on snapshot of feature data on a schedule.
-
-        Experimental:
-            Public API is subject to change, this feature is not suitable for production use-cases.
+        """Create a job to compute statistics on snapshot of feature data on a schedule.
 
         Example:
             ```python3
             # fetch feature view
             fv = fs.get_feature_view(name="my_feature_view", version=1)
+
             # enable statistics monitoring
-            my_config = fv._create_statistics_monitoring(
+            my_config = fv.create_scheduled_statistics(
                 name="my_config",
                 start_date_time="2021-01-01 00:00:00",
                 description="my description",
@@ -3693,7 +3974,7 @@ class FeatureView:
         Parameters:
             name: Name of the feature monitoring configuration.
                 name must be unique for all configurations attached to the feature view.
-            feature_name: Name of the feature to monitor. If not specified, statistics
+            feature_names: Names of the features to monitor. If not specified, statistics
                 will be computed for all features.
             description: Description of the feature monitoring configuration.
             start_date_time: Start date and time from which to start computing statistics.
@@ -3711,24 +3992,33 @@ class FeatureView:
         """
         if not self._id:
             raise FeatureStoreException(
-                "Only Feature View registered with Hopsworks can enable scheduled statistics monitoring."
+                "Only Feature View registered with Hopsworks can enable scheduled statistics."
             )
 
-        return self._feature_monitoring_config_engine._build_default_statistics_monitoring_config(
+        valid_features = {feat.name: feat.type for feat in self._features}
+        valid_feature_names = list(valid_features.keys())
+
+        if feature_names is None:
+            # choose all features if none is selected
+            feature_names = valid_feature_names
+        elif not isinstance(feature_names, list):
+            feature_names = [feature_names]
+
+        return self._feature_monitoring_config_engine._build_default_scheduled_statistics_config(
             name=name,
-            feature_name=feature_name,
+            feature_names=feature_names,
             description=description,
             start_date_time=start_date_time,
-            valid_feature_names=[feat.name for feat in self._features],
+            valid_feature_names=valid_feature_names,
             cron_expression=cron_expression,
             end_date_time=end_date_time,
+            valid_features=valid_features,
         )
 
     @public
     def create_feature_monitoring(
         self,
         name: str,
-        feature_name: str,
         description: str | None = None,
         start_date_time: int | str | datetime | date | pd.Timestamp | None = None,
         end_date_time: int | str | datetime | date | pd.Timestamp | None = None,
@@ -3743,10 +4033,10 @@ class FeatureView:
             ```python3
             # fetch feature view
             fg = fs.get_feature_view(name="my_feature_view", version=1)
+
             # enable feature monitoring
             my_config = fg.create_feature_monitoring(
                 name="my_monitoring_config",
-                feature_name="my_feature",
                 description="my monitoring config description",
                 cron_expression="0 0 12 ? * * *",
             ).with_detection_window(
@@ -3757,6 +4047,7 @@ class FeatureView:
                 # compare to a given value
                 specific_value=0.5,
             ).compare_on(
+                feature_name="my_feature",
                 metric="mean",
                 threshold=0.5,
             ).save()
@@ -3764,17 +4055,16 @@ class FeatureView:
 
         Parameters:
             name: Name of the feature monitoring configuration.
-                name must be unique for all configurations attached to the feature group.
-            feature_name: Name of the feature to monitor.
+                name must be unique for all configurations attached to the feature view.
             description: Description of the feature monitoring configuration.
             start_date_time: Start date and time from which to start computing statistics.
             end_date_time: End date and time at which to stop computing statistics.
-            cron_expression: Cron expression to use to schedule the job. The cron expression
-                must be in UTC and follow the Quartz specification. Default is '0 0 12 ? * * *',
-                every day at 12pm UTC.
+            cron_expression: Cron expression to use to schedule the job.
+                The cron expression must be in UTC and follow the Quartz specification.
+                The default value means "every day at 12pm UTC".
 
         Raises:
-            hopsworks.client.exceptions.FeatureStoreException: If the feature view is not registered in Hopsworks
+            hopsworks.client.exceptions.FeatureStoreException: If the feature view is not registered in Hopsworks.
 
         Returns:
             Configuration with minimal information about the feature monitoring.
@@ -3785,15 +4075,147 @@ class FeatureView:
                 "Only Feature View registered with Hopsworks can enable feature monitoring."
             )
 
+        valid_features = {feat.name: feat.type for feat in self._features}
         return self._feature_monitoring_config_engine._build_default_feature_monitoring_config(
             name=name,
-            feature_name=feature_name,
             description=description,
             start_date_time=start_date_time,
-            valid_feature_names=[feat.name for feat in self._features],
+            valid_feature_names=list(valid_features.keys()),
+            end_date_time=end_date_time,
+            cron_expression=cron_expression,
+            valid_features=valid_features,
+        )
+
+    @public
+    def create_model_monitoring(
+        self,
+        name: str,
+        model_name: str,
+        model_version: int,
+        description: str | None = None,
+        start_date_time: int | str | datetime | date | pd.Timestamp | None = None,
+        end_date_time: int | str | datetime | date | pd.Timestamp | None = None,
+        cron_expression: str | None = "0 0 12 ? * * *",
+    ) -> fmc.FeatureMonitoringConfig:
+        """Enable feature monitoring on the inference logs of a specific deployed model.
+
+        Targets the logging feature group (``{fv_name}_{version}_log``) and filters by
+        ``model_name`` and ``model_version`` so the FM job only consumes the inference
+        rows produced by that one deployment. The reference window
+        defaults to the training dataset version used to train the model — this is
+        recorded on the model at registration time. Any explicit
+        :func:`FeatureMonitoringConfig.with_reference_training_dataset` call is validated
+        against the model's training TD version and raises on mismatch.
+
+        Experimental:
+            Public API is subject to change, this feature is not suitable for production use-cases.
+
+        Example:
+            ```python3
+            fv = fs.get_feature_view(name="my_feature_view", version=1)
+
+            my_config = fv.create_model_monitoring(
+                name="model_psi_monitoring",
+                model_name="iris_classifier",
+                model_version=3,
+                cron_expression="0 0 12 ? * * *",
+            ).with_detection_window(
+                # served by this model in the last day
+                time_offset="1d",
+                window_length="1d",
+            ).with_reference_training_dataset(
+                # omitted -> defaults to the TD version used to train iris_classifier v3
+            ).compare_on_distribution(
+                feature_name="petal_length",
+                metric="PSI",
+                threshold=0.2,
+            ).save()
+            ```
+
+        Parameters:
+            name: Name of the feature monitoring configuration. Must be unique among the
+                configurations attached to the logging feature group.
+            model_name: Name of the model whose inference logs are monitored.
+            model_version: Version of the model whose inference logs are monitored.
+            description: Description of the feature monitoring configuration.
+            start_date_time: Start date and time from which to start computing statistics.
+            end_date_time: End date and time at which to stop computing statistics.
+            cron_expression: Cron expression to use to schedule the job. The cron
+                expression must be in UTC and follow the Quartz specification. The
+                default value means "every day at 12pm UTC".
+
+        Raises:
+            hopsworks.client.exceptions.FeatureStoreException: If feature logging is not
+                enabled, the feature view is not registered, the named model is not
+                found, or the model has no recorded training dataset version.
+
+        Returns:
+            Configuration with minimal information about the feature monitoring.
+            Additional information are required before feature monitoring is enabled.
+        """
+        if not self.logging_enabled:
+            raise FeatureStoreException(
+                "Feature logging is not enabled for this feature view. "
+                "Call self.enable_logging() first."
+            )
+
+        # Idea A — warn when a sub-hourly cron is used for model monitoring.
+        # The inference-log feature group materializes offline data at most hourly, so a
+        # finer cron produces redundant or incomplete detection windows.
+        if util._is_sub_hour_cron(cron_expression):
+            warnings.warn(
+                f"The cron expression '{cron_expression}' fires more than once per hour "
+                "but the inference-log feature group materializes offline data at most "
+                "hourly. Sub-hourly crons produce redundant or incomplete detection "
+                "windows. Consider using a cron that fires at most once per hour (e.g. "
+                "'0 0 * * * ? *'). ",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # Lazy imports: hsml is a sibling SDK package and the rest of hsfs imports it
+        # the same way (see explicit_provenance.py).
+        try:
+            from hsml.core import model_api as hsml_model_api
+        except ModuleNotFoundError as err:
+            raise FeatureStoreException(
+                "Model monitoring requires the hsml library, which is not installed. "
+                "Install hsml before creating a model monitoring configuration."
+            ) from err
+
+        _client = client._get_instance()
+        model_meta = hsml_model_api.ModelApi()._get(
+            name=model_name,
+            version=model_version,
+            model_registry_id=_client._project_id,
+        )
+        if model_meta is None:
+            raise FeatureStoreException(
+                f"Model '{model_name}' version {model_version} was not found in the "
+                "model registry of this project."
+            )
+        training_dataset_version = model_meta.training_dataset_version
+        if not training_dataset_version:
+            raise FeatureStoreException(
+                f"Model '{model_name}' version {model_version} has no recorded "
+                "training dataset version. Re-register the model with the feature "
+                "view and training_dataset_version that was used to train it."
+            )
+
+        logging_fg = self.feature_logging.get_feature_group()
+        config = logging_fg.create_feature_monitoring(
+            name=name,
+            description=description,
+            start_date_time=start_date_time,
             end_date_time=end_date_time,
             cron_expression=cron_expression,
         )
+        # Stamp model fields onto the config — they are persisted via to_dict() and
+        # threaded through to the FM job, where they become a Filter on the logging FG.
+        config._model_name = model_name
+        config._model_version = model_version
+        config._associated_model_td_version = training_dataset_version
+        return config
 
     @public
     def get_alerts(self) -> list[FeatureViewAlert] | Alert:
@@ -3835,8 +4257,18 @@ class FeatureView:
     def create_alert(
         self,
         receiver: str,
-        status: str,
-        severity: str,
+        status: Literal[
+            "feature_validation_success",
+            "feature_validation_warning",
+            "feature_validation_failure",
+            "monitoring_shift_undetected",
+            "monitoring_shift_detected",
+            "monitoring_empty_detection_window",
+            # deprecated since ~=3.8.1; kept for one release
+            "feature_monitor_shift_undetected",
+            "feature_monitor_shift_detected",
+        ],
+        severity: Literal["info", "warning", "critical"],
     ) -> FeatureViewAlert:
         """Create an alert for this feature view.
 
@@ -3849,15 +4281,18 @@ class FeatureView:
             # create an alert
             alert = feature_view.create_alert(
                 receiver="email",
-                status="feature_monitor_shift_undetected",
+                status="monitoring_shift_undetected",
                 severity="info",
             )
             ```
 
         Parameters:
-            receiver: str. The receiver of the alert.
-            status: str. The status that will trigger the alert. Can be "feature_monitor_shift_undetected" or "feature_monitor_shift_detected".
-            severity: str. The severity of the alert. Can be "info", "warning" or "critical".
+            receiver: The receiver of the alert.
+            status: The status that will trigger the alert.
+                The names feature_monitor_shift_undetected and
+                feature_monitor_shift_detected are deprecated since ~=3.8.1 and will
+                be removed in a future release.
+            severity: The severity of the alert.
 
         Returns:
             The created FeatureViewAlert object.
@@ -3865,7 +4300,7 @@ class FeatureView:
         Raises:
             ValueError: If the status is not valid.
             ValueError: If the severity is not valid.
-            hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request
+            hopsworks.client.exceptions.RestAPIError: If the backend encounters an error when handling the request.
         """
         return self._alert_api.create_feature_view_alert(
             feature_store_id=self._feature_store_id,
@@ -3934,6 +4369,53 @@ class FeatureView:
                 )
                 features[feature_index] = feature
         fv.schema = features
+
+        # The backend serializes the feature view's complete on-demand
+        # transformation chain, including the producers of dropped intermediates
+        # that surface no feature. Hydrate it so the on-demand graph is built
+        # from the full chain rather than reconstructed from per-feature
+        # attachments (which lose dropped-intermediate producers). Older
+        # backends omit this field, so the property falls back to the per-feature
+        # walk.
+        on_demand_transformation_functions = json_decamelized.get(
+            "on_demand_transformation_functions", None
+        )
+        if on_demand_transformation_functions:
+            fv.__on_demand_transformation_functions = [
+                TransformationFunction.from_response_json(
+                    {
+                        **transformation_function,
+                        "transformation_type": TransformationType.ON_DEMAND,
+                    }
+                )
+                for transformation_function in on_demand_transformation_functions
+            ]
+
+        # The schema is known here, so both graphs rebuild with the entity's
+        # feature names: a consumed name that exists both as a raw feature
+        # and as another TF's output triggers the ambiguity warning. Cycles
+        # downgrade to a warning so the entity stays readable.
+        # Only raw features count: an on-demand output (incl. a kept chained
+        # intermediate) is not a raw feature, so excluding it avoids warning
+        # on every chained output the schema carries.
+        schema_feature_names = {
+            feature.name
+            for feature in features
+            if feature.on_demand_transformation_function is None
+        }
+        fv._on_demand_transformation_execution_graph = (
+            transformation_execution_dag.TransformationExecutionDAG(
+                fv._on_demand_transformation_functions,
+                schema_feature_names=schema_feature_names,
+            )
+        )
+        fv._model_dependent_transformation_execution_graph = (
+            transformation_execution_dag.TransformationExecutionDAG(
+                fv.transformation_functions,
+                schema_feature_names=schema_feature_names,
+            )
+        )
+
         fv.labels = [feature.name for feature in features if feature.label]
         fv.inference_helper_columns = [
             feature.name for feature in features if feature.inference_helper_column
@@ -3983,25 +4465,32 @@ class FeatureView:
         request_parameters: list[dict[str, Any]] | dict[str, Any] | None = None,
         transformation_context: dict[str, Any] | None = None,
         return_type: Literal["list", "numpy", "pandas", "polars"] | None = None,
+        n_processes: int | None = None,
     ) -> list[Any] | list[list[Any]] | pd.DataFrame | pl.DataFrame:
         """Function computes on-demand features present in the feature view.
 
         Parameters:
             feature_vector: The feature vector to be transformed.
             request_parameters: Request parameters required by on-demand transformation functions to compute on-demand features present in the feature view.
-                These parameters take **higheshighestt priority** when resolving feature values - if a key exists in both `request_parameters` and the feature vector, the value from `request_parameters` is used.
+                These parameters take **highest priority** when resolving feature values.
+                If a key exists in both `request_parameters` and the feature vector, the value from `request_parameters` is used.
             transformation_context: A dictionary mapping variable names to objects that will be provided as contextual information to the transformation function at runtime.
                 The `context` variable must be explicitly defined as parameters in the transformation function for these to be accessible during execution.
             return_type: Defaults to the same type as the input feature vector.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             The feature vector that contains all on-demand features in the feature view.
         """
-        return self._vector_server.compute_on_demand_features(
+        return self._vector_server._compute_on_demand_features(
             feature_vectors=feature_vector,
             request_parameters=request_parameters,
             transformation_context=transformation_context,
             return_type=return_type,
+            n_processes=n_processes,
         )
 
     @public
@@ -4011,6 +4500,7 @@ class FeatureView:
         external: bool | None = None,
         transformation_context: dict[str, Any] | None = None,
         return_type: Literal["list", "numpy", "pandas", "polars"] | None = None,
+        n_processes: int | None = None,
     ) -> list[Any] | list[list[Any]] | pd.DataFrame | pl.DataFrame:
         """Transform the input feature vector by applying Model-dependent transformations attached to the feature view.
 
@@ -4028,6 +4518,10 @@ class FeatureView:
             transformation_context: A dictionary mapping variable names to objects that will be provided as contextual information to the transformation function at runtime.
                 The `context` variable must be explicitly defined as parameters in the transformation function for these to be accessible during execution.
             return_type: Defaults to the same type as the input feature vector.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             The transformed feature vector obtained by applying Model-Dependent Transformations.
@@ -4035,10 +4529,11 @@ class FeatureView:
         if not self._vector_server._serving_initialized:
             self.init_serving(external=external)
 
-        return self._vector_server.transform(
+        return self._vector_server._transform(
             feature_vectors=feature_vector,
             transformation_context=transformation_context,
             return_type=return_type,
+            n_processes=n_processes,
         )
 
     @public
@@ -4080,8 +4575,8 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: In case the backend encounters an issue
         """
-        fv = self._feature_view_engine.enable_feature_logging(self, extra_log_columns)
-        self._feature_logging = self._feature_view_engine.get_feature_logging(fv)
+        fv = self._feature_view_engine._enable_feature_logging(self, extra_log_columns)
+        self._feature_logging = self._feature_view_engine._get_feature_logging(fv)
         return fv
 
     @public
@@ -4260,7 +4755,7 @@ class FeatureView:
                 stacklevel=1,
             )
             logging_features = (
-                self._feature_view_engine.get_logging_feature_from_dataframe(
+                self._feature_view_engine._get_logging_feature_from_dataframe(
                     dataframes=[
                         untransformed_features,
                         transformed_features,
@@ -4275,7 +4770,7 @@ class FeatureView:
                 )
             )
             self.enable_logging(extra_log_columns=logging_features)
-        return self._feature_view_engine.log_features(
+        return self._feature_view_engine._log_features(
             self,
             feature_logging=self.feature_logging,
             logs=logging_data,
@@ -4327,7 +4822,7 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: in case the backend fails to retrieve the log timeline.
         """
-        return self._feature_view_engine.get_log_timeline(
+        return self._feature_view_engine._get_log_timeline(
             self, wallclock_time, limit, transformed
         )
 
@@ -4377,7 +4872,7 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: in case the backend fails to read the log entries.
         """
-        return self._feature_view_engine.read_feature_logs(
+        return self._feature_view_engine._read_feature_logs(
             self,
             start_time,
             end_time,
@@ -4402,7 +4897,7 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: in case the backend fails to pause feature logging.
         """
-        self._feature_view_engine.pause_logging(self)
+        self._feature_view_engine._pause_logging(self)
 
     @public
     def resume_logging(self) -> None:
@@ -4417,7 +4912,7 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: in case the backend fails to pause feature logging.
         """
-        self._feature_view_engine.resume_logging(self)
+        self._feature_view_engine._resume_logging(self)
 
     @public
     def materialize_log(
@@ -4441,7 +4936,7 @@ class FeatureView:
         Raises:
             hopsworks.client.exceptions.RestAPIError: in case the backend fails to materialize the log.
         """
-        return self._feature_view_engine.materialize_feature_logs(
+        return self._feature_view_engine._materialize_feature_logs(
             self, wait, transformed
         )
 
@@ -4462,7 +4957,7 @@ class FeatureView:
              hopsworks.client.exceptions.RestAPIError: in case the backend fails to delete the log.
         """
         if self.feature_logging is not None:
-            self._feature_view_engine.delete_feature_logs(
+            self._feature_view_engine._delete_feature_logs(
                 self, self.feature_logging, transformed
             )
 
@@ -4495,7 +4990,7 @@ class FeatureView:
         from hsfs.feature_logger_async import AsyncFeatureLogger
 
         return AsyncFeatureLogger(
-            project_id=int(client.get_instance()._project_id),
+            project_id=int(client._get_instance()._project_id),
             source="localhost",
             namespace=os.environ["HOPSWORKS_PROJECT_NAME"].replace("_", "-"),
             deployment_name=os.environ["DEPLOYMENT_NAME"],
@@ -4516,6 +5011,7 @@ class FeatureView:
         online: bool | None = None,
         transformation_context: dict[str, Any] | list[dict[str, Any]] = None,
         request_parameters: dict[str, Any] | list[dict[str, Any]] = None,
+        n_processes: int | None = None,
     ) -> dict[str, Any] | pd.DataFrame:
         """Apply on-demand transformations attached to the feature view on the provided data.
 
@@ -4560,6 +5056,10 @@ class FeatureView:
                 Request parameters passed to the transformation functions.
                 For batch processing with different parameters per row, provide a list of dictionaries.
                 These parameters take **highest priority** when resolving feature values -- if a key exists in both `request_parameters` and the input data, the value from `request_parameters` is used.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             The transformed data in the same format as the input:
@@ -4567,12 +5067,13 @@ class FeatureView:
                 - `dict[str, Any]` if input was a dictionary
         """
         if self._on_demand_transformation_functions:
-            data = self._feature_view_engine.apply_transformations(
-                transformation_functions=self._on_demand_transformation_functions,
+            data = self._feature_view_engine._apply_transformations(
+                execution_graph=self._on_demand_transformation_execution_graph,
                 data=data,
                 online=online,
                 transformation_context=transformation_context,
                 request_parameters=request_parameters,
+                n_processes=n_processes,
             )
         else:
             _logger.info(
@@ -4587,6 +5088,7 @@ class FeatureView:
         online: bool | None = None,
         transformation_context: dict[str, Any] | list[dict[str, Any]] = None,
         request_parameters: dict[str, Any] | list[dict[str, Any]] = None,
+        n_processes: int | None = None,
     ) -> dict[str, Any] | pd.DataFrame:
         """Apply model-dependent transformations attached to the feature view on the provided data.
 
@@ -4634,6 +5136,10 @@ class FeatureView:
                 Request parameters passed to the transformation functions.
                 For batch processing with different parameters per row, provide a list of dictionaries.
                 These parameters take **highest priority** when resolving feature values -- if a key exists in both `request_parameters` and the input data, the value from `request_parameters` is used.
+            n_processes: Number of worker processes used to apply transformation functions in parallel.
+                Independent transformations run concurrently; a chained sequence runs in order.
+                Defaults to `1` (sequential execution); a value above the DAG's maximum parallelism is capped, with a warning.
+                Ignored by the Spark engine, which pushes transformations down to Spark.
 
         Returns:
             The transformed data in the same format as the input:
@@ -4641,12 +5147,13 @@ class FeatureView:
                 - `dict[str, Any]` if input was a dictionary
         """
         if self.transformation_functions:
-            data = self._feature_view_engine.apply_transformations(
-                transformation_functions=self.transformation_functions,
+            data = self._feature_view_engine._apply_transformations(
+                execution_graph=self._model_dependent_transformation_execution_graph,
                 data=data,
                 online=online,
                 transformation_context=transformation_context,
                 request_parameters=request_parameters,
+                n_processes=n_processes,
             )
         else:
             _logger.info(
@@ -4727,7 +5234,7 @@ class FeatureView:
             "type": "featureViewDTO",
             "extraLogColumns": self._extra_log_columns,
         }
-        tags_dict = tag.Tag.tags_to_dict(self._tags)
+        tags_dict = tag.Tag._tags_to_dict(self._tags)
         if tags_dict:
             fv_dict["tags"] = tags_dict
         return fv_dict
@@ -4755,7 +5262,7 @@ class FeatureView:
         Returns:
             List of training dataset features objects.
         """
-        return self._feature_view_engine.get_training_dataset_schema(
+        return self._feature_view_engine._get_training_dataset_schema(
             self, training_dataset_version
         )
 
@@ -4821,7 +5328,7 @@ class FeatureView:
 
     @labels.setter
     def labels(self, labels: list[str]) -> None:
-        self._labels = [util.autofix_feature_name(lb) for lb in labels]
+        self._labels = [util._autofix_feature_name(lb) for lb in labels]
 
     @public
     @property
@@ -4835,7 +5342,7 @@ class FeatureView:
     @inference_helper_columns.setter
     def inference_helper_columns(self, inference_helper_columns: list[str]) -> None:
         self._inference_helper_columns = [
-            util.autofix_feature_name(exf) for exf in inference_helper_columns
+            util._autofix_feature_name(exf) for exf in inference_helper_columns
         ]
 
     @public
@@ -4850,7 +5357,7 @@ class FeatureView:
     @training_helper_columns.setter
     def training_helper_columns(self, training_helper_columns: list[str]) -> None:
         self._training_helper_columns = [
-            util.autofix_feature_name(exf) for exf in training_helper_columns
+            util._autofix_feature_name(exf) for exf in training_helper_columns
         ]
 
     @public
@@ -4920,6 +5427,14 @@ class FeatureView:
         transformation_functions: list[TransformationFunction],
     ) -> None:
         self._transformation_functions = transformation_functions
+        # Reassigning the TF list must rebuild the execution DAG; otherwise
+        # subsequent calls use a stale graph and a stale topological order.
+        # A cyclic configuration is rejected here, when the DAG is rebuilt.
+        self._model_dependent_transformation_execution_graph = (
+            transformation_execution_dag.TransformationExecutionDAG(
+                transformation_functions,
+            )
+        )
 
     @public
     @property
@@ -4928,7 +5443,7 @@ class FeatureView:
         return {
             transformation_function.hopsworks_udf.output_column_names[
                 0
-            ]: transformation_function.hopsworks_udf.get_udf()
+            ]: transformation_function.hopsworks_udf._get_udf()
             for transformation_function in self.transformation_functions
         }
 
@@ -4937,19 +5452,34 @@ class FeatureView:
     def on_demand_transformations(self) -> dict[str, Callable]:
         """Get On-Demand transformations as a dictionary mapping on-demand feature names to transformation function."""
         return {
-            feature.on_demand_transformation_function.hopsworks_udf.function_name: feature.on_demand_transformation_function.hopsworks_udf.get_udf()
+            feature.on_demand_transformation_function.hopsworks_udf.function_name: feature.on_demand_transformation_function.hopsworks_udf._get_udf()
             for feature in self.features
             if feature.on_demand_transformation_function
         }
 
     @property
     def _on_demand_transformation_functions(self) -> list[TransformationFunction]:
-        """Get all on-demand transformations in the feature view."""
-        return [
-            feature.on_demand_transformation_function
-            for feature in self.features
-            if feature.on_demand_transformation_function
-        ]
+        """Get all on-demand transformations in the feature view.
+
+        When the backend serializes the complete chain it is used directly: it
+        includes the producers of dropped intermediates, which surface no
+        feature and so cannot be recovered from per-feature attachments.
+
+        The fallback (older backends that omit the list) reconstructs from the
+        features. A multi-output TF appears on every feature it produces, so the
+        raw collection contains duplicates. Dedup by `__eq__` (which compares the
+        serialized TF) and preserve the first occurrence so downstream DAG
+        construction sees each TF exactly once. This fallback cannot recover the
+        producers of dropped intermediates, which surface no feature.
+        """
+        if self.__on_demand_transformation_functions is not None:
+            return self.__on_demand_transformation_functions
+        seen: list[TransformationFunction] = []
+        for feature in self.features:
+            tf = feature.on_demand_transformation_function
+            if tf and tf not in seen:
+                seen.append(tf)
+        return seen
 
     @public
     @property
@@ -4957,12 +5487,19 @@ class FeatureView:
         """Get request parameters required for the for on-demand transformations atatched to the feature view."""
         if self._request_parameters is None:
             feature_names = [feature.name for feature in self.features]
+            # Intermediate features: outputs of one TF that are inputs to
+            # another. These are computed by the transformation chain and
+            # should not be listed as required request parameters.
+            all_output_cols: set[str] = set()
+            for tf in self._on_demand_transformation_functions:
+                all_output_cols.update(tf.hopsworks_udf.output_column_names)
             self._request_parameters = []
             for tf in self._on_demand_transformation_functions:
                 for feature_name in tf.hopsworks_udf.transformation_features:
                     if (
                         feature_name not in feature_names
                         and feature_name not in self._request_parameters
+                        and feature_name not in all_output_cols
                     ):
                         self._request_parameters.append(feature_name)
 
@@ -5008,8 +5545,8 @@ class FeatureView:
             or self._serving_keys is None
             or len(self._serving_keys) == 0
         ):
-            self._serving_keys = util.build_serving_keys_from_prepared_statements(
-                self._feature_view_engine._feature_view_api.get_serving_prepared_statement(
+            self._serving_keys = util._build_serving_keys_from_prepared_statements(
+                self._feature_view_engine._feature_view_api._get_serving_prepared_statement(
                     name=self.name,
                     version=self.version,
                     batch=False,
@@ -5039,7 +5576,7 @@ class FeatureView:
     def feature_logging(self) -> FeatureLogging | None:
         """Feature logging feature groups of this feature view."""
         if self.logging_enabled and self._feature_logging is None:
-            self._feature_logging = self._feature_view_engine.get_feature_logging(self)
+            self._feature_logging = self._feature_view_engine._get_feature_logging(self)
         return self._feature_logging
 
     def _get_spine_fg_ids(self) -> list[feature_group.SpineGroup]:
