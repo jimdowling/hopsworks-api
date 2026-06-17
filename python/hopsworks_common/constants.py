@@ -159,6 +159,7 @@ class MODEL_REGISTRY:
     HOPSFS_MOUNT_PREFIX = "/hopsfs/"
     MODELS_DATASET = "Models"
     MODEL_FILES_DIR_NAME = "Files"
+    MODEL_CACHE_DIR_DEFAULT = "/tmp/hopsworks/models"
 
 
 class MODEL_SERVING:
@@ -206,6 +207,9 @@ class PREDICTOR:
     # serving tool
     SERVING_TOOL_DEFAULT = "DEFAULT"
     SERVING_TOOL_KSERVE = "KSERVE"
+    # vLLM variant
+    VLLM_VARIANT_VLLM = "VLLM"
+    VLLM_VARIANT_OMNI = "VLLM_OMNI"
 
 
 class PREDICTOR_STATE:

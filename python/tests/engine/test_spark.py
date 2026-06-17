@@ -42,7 +42,7 @@ from hsfs.client import exceptions
 from hsfs.constructor import hudi_feature_group_alias, query
 from hsfs.core import data_source as ds
 from hsfs.core import online_ingestion, training_dataset_engine
-from hsfs.core.constants import HAS_GREAT_EXPECTATIONS
+from hsfs.core.constants import GE_MAJOR, HAS_GREAT_EXPECTATIONS
 from hsfs.engine import spark
 from hsfs.hopsworks_udf import udf
 from hsfs.serving_key import ServingKey
@@ -1212,286 +1212,6 @@ class TestSpark:
             mock_spark_engine_save_offline_dataframe.call_count
             == expected_offline_calls
         )
-
-    def test_save_dataframe_delta_calls_check_duplicate_records(self, mocker):
-        # Arrange
-        mock_check_duplicate_records = mocker.patch(
-            "hsfs.engine.spark.Engine._check_duplicate_records"
-        )
-        mock_spark_engine_save_offline_dataframe = mocker.patch(
-            "hsfs.engine.spark.Engine._save_offline_dataframe"
-        )
-
-        spark_engine = spark.Engine()
-
-        fg = feature_group.FeatureGroup(
-            name="test",
-            version=1,
-            featurestore_id=99,
-            primary_key=["pk1"],
-            partition_key=[],
-            id=10,
-            time_travel_format="DELTA",
-        )
-
-        mock_dataframe = mocker.Mock(spec=DataFrame)
-
-        # Act
-        spark_engine.save_dataframe(
-            feature_group=fg,
-            dataframe=mock_dataframe,
-            operation="insert",
-            online_enabled=False,
-            storage="offline",
-            offline_write_options=None,
-            online_write_options=None,
-            validation_id=None,
-        )
-
-        # Assert
-        assert mock_check_duplicate_records.call_count == 1
-        mock_check_duplicate_records.assert_called_once_with(mock_dataframe, fg)
-        assert mock_spark_engine_save_offline_dataframe.call_count == 1
-
-    def test_save_dataframe_non_delta_does_not_call_check_duplicate_records(
-        self, mocker
-    ):
-        # Arrange
-        mock_check_duplicate_records = mocker.patch(
-            "hsfs.engine.spark.Engine._check_duplicate_records"
-        )
-        mock_spark_engine_save_offline_dataframe = mocker.patch(
-            "hsfs.engine.spark.Engine._save_offline_dataframe"
-        )
-
-        spark_engine = spark.Engine()
-
-        fg = feature_group.FeatureGroup(
-            name="test",
-            version=1,
-            featurestore_id=99,
-            primary_key=["pk1"],
-            partition_key=[],
-            id=10,
-            time_travel_format="HUDI",
-        )
-
-        mock_dataframe = mocker.Mock(spec=DataFrame)
-
-        # Act
-        spark_engine.save_dataframe(
-            feature_group=fg,
-            dataframe=mock_dataframe,
-            operation="insert",
-            online_enabled=False,
-            storage="offline",
-            offline_write_options=None,
-            online_write_options=None,
-            validation_id=None,
-        )
-
-        # Assert
-        assert mock_check_duplicate_records.call_count == 0
-        assert mock_spark_engine_save_offline_dataframe.call_count == 1
-
-    @pytest.mark.parametrize(
-        "test_name,primary_key,partition_key,event_time,data",
-        [
-            (
-                "duplicate_primary_key",
-                ["id"],
-                [],
-                None,
-                [
-                    {"id": 1, "text": "a"},
-                    {"id": 1, "text": "a_dup"},
-                    {"id": 2, "text": "b"},
-                ],
-            ),
-            (
-                "duplicate_primary_key_partition",
-                ["id"],
-                ["p"],
-                None,
-                [
-                    {"id": 1, "p": 0, "text": "a_p0"},
-                    {"id": 1, "p": 0, "text": "a_p0_dup"},
-                    {"id": 2, "p": 0, "text": "b_p0"},
-                ],
-            ),
-            (
-                "duplicate_primary_key_event_time",
-                ["id"],
-                [],
-                "event_time",
-                [
-                    {"id": 1, "event_time": "2024-01-01", "text": "a_t1"},
-                    {"id": 1, "event_time": "2024-01-01", "text": "a_t1_dup"},
-                    {"id": 2, "event_time": "2024-01-02", "text": "b_t2"},
-                ],
-            ),
-        ],
-    )
-    def test_save_dataframe_delta_duplicate_should_fail(
-        self, mocker, test_name, primary_key, partition_key, event_time, data
-    ):
-        # Arrange
-        from datetime import datetime
-
-        mocker.patch("hsfs.engine.get_type", return_value="spark")
-        mocker.patch(
-            "hsfs.feature_group.FeatureGroup._has_deltalake", return_value=True
-        )
-
-        spark_engine = spark.Engine()
-
-        fg = feature_group.FeatureGroup(
-            name=f"dl_dup_{test_name}",
-            version=1,
-            featurestore_id=99,
-            primary_key=primary_key,
-            partition_key=partition_key,
-            event_time=event_time,
-            time_travel_format="DELTA",
-        )
-
-        # Convert event_time strings to datetime if needed
-        if event_time and any(isinstance(row.get(event_time), str) for row in data):
-            for row in data:
-                if event_time in row and isinstance(row[event_time], str):
-                    row[event_time] = datetime.fromisoformat(row[event_time])
-
-        df = spark_engine._spark_session.createDataFrame(data)
-
-        # Act & Assert
-        with pytest.raises(exceptions.FeatureStoreException) as exc_info:
-            spark_engine.save_dataframe(
-                feature_group=fg,
-                dataframe=df,
-                operation="insert",
-                online_enabled=True,
-                storage="offline",
-                offline_write_options={},
-                online_write_options={},
-                validation_id=None,
-            )
-
-        assert exceptions.FeatureStoreException.DUPLICATE_RECORD_ERROR_MESSAGE in str(
-            exc_info.value
-        )
-
-    @pytest.mark.parametrize(
-        "test_name,primary_key,partition_key,event_time,data_factory",
-        [
-            (
-                "pk_partition_across",
-                ["id"],
-                ["p"],
-                None,
-                lambda dt: [
-                    {"id": 1, "p": 0, "text": "a_p0"},
-                    {"id": 1, "p": 1, "text": "a_p1"},
-                    {"id": 2, "p": 0, "text": "b_p0"},
-                ],
-            ),
-            (
-                "pk_event_time_across",
-                ["id"],
-                [],
-                "event_time",
-                lambda dt: [
-                    {"id": 1, "event_time": dt.datetime(2024, 1, 1), "text": "a_t1"},
-                    {"id": 1, "event_time": dt.datetime(2024, 1, 2), "text": "a_t2"},
-                    {"id": 2, "event_time": dt.datetime(2024, 1, 1), "text": "b_t1"},
-                ],
-            ),
-            (
-                "pk_with_no_duplicate",
-                ["id"],
-                [],
-                None,
-                lambda dt: [
-                    {"id": 1, "text": "a"},
-                    {"id": 2, "text": "b"},
-                    {"id": 3, "text": "c"},
-                ],
-            ),
-            (
-                "no_pk_partition_only",
-                [],
-                ["p"],
-                None,
-                lambda dt: [
-                    {"id": 1, "p": 0, "text": "a_p0"},
-                    {"id": 1, "p": 1, "text": "a_p1"},
-                    {"id": 2, "p": 0, "text": "b_p0"},
-                ],
-            ),
-            (
-                "no_pk_event_time_only",
-                [],
-                [],
-                "event_time",
-                lambda dt: [
-                    {"id": 1, "event_time": dt.datetime(2024, 1, 1), "text": "a_t1"},
-                    {"id": 1, "event_time": dt.datetime(2024, 1, 2), "text": "a_t2"},
-                    {"id": 2, "event_time": dt.datetime(2024, 1, 1), "text": "b_t1"},
-                ],
-            ),
-            (
-                "no_pk",
-                [],
-                [],
-                None,
-                lambda dt: [
-                    {"id": 1, "text": "a"},
-                    {"id": 1, "text": "a_dup"},
-                    {"id": 2, "text": "b"},
-                ],
-            ),
-        ],
-    )
-    def test_save_dataframe_delta_duplicate_should_succeed(
-        self, mocker, test_name, primary_key, partition_key, event_time, data_factory
-    ):
-        # Arrange
-        mocker.patch("hsfs.engine.get_type", return_value="spark")
-        mocker.patch(
-            "hsfs.feature_group.FeatureGroup._has_deltalake", return_value=True
-        )
-        mock_spark_engine_save_offline_dataframe = mocker.patch(
-            "hsfs.engine.spark.Engine._save_offline_dataframe"
-        )
-
-        spark_engine = spark.Engine()
-
-        fg = feature_group.FeatureGroup(
-            name=f"dl_dup_{test_name}",
-            version=1,
-            featurestore_id=99,
-            primary_key=primary_key,
-            partition_key=partition_key,
-            event_time=event_time,
-            time_travel_format="DELTA",
-        )
-
-        data = data_factory(datetime)
-        df = spark_engine._spark_session.createDataFrame(data)
-
-        # Act - should not raise exception
-        spark_engine.save_dataframe(
-            feature_group=fg,
-            dataframe=df,
-            operation="insert",
-            online_enabled=True,
-            storage="offline",
-            offline_write_options={},
-            online_write_options={},
-            validation_id=None,
-        )
-
-        # Assert - no exception should be raised, and save should be called
-        assert mock_spark_engine_save_offline_dataframe.call_count == 1
 
     def test_save_stream_dataframe(self, mocker, backend_fixtures):
         # Arrange
@@ -4632,8 +4352,8 @@ class TestSpark:
         )
 
     @pytest.mark.skipif(
-        HAS_GREAT_EXPECTATIONS is False,
-        reason="Great Expectations is not installed",
+        HAS_GREAT_EXPECTATIONS is False or GE_MAJOR != 0,
+        reason="GE 0.x-only Spark validate path: BaseDataContext + RuntimeBatchRequest were removed in GE 1.x.",
     )
     def test_validate_with_great_expectations(self, mocker):
         # Arrange
@@ -4685,6 +4405,58 @@ class TestSpark:
             },
             "success": True,
         }
+
+    @pytest.mark.skipif(
+        HAS_GREAT_EXPECTATIONS is False or GE_MAJOR != 1,
+        reason="GE 1.x-only Spark validate path: uses gx.get_context + add_spark.",
+    )
+    def test_validate_with_great_expectations_v1(self):
+        import great_expectations
+        from great_expectations.expectations.expectation_configuration import (
+            ExpectationConfiguration,
+        )
+
+        # Arrange: a Spark DataFrame with one all-non-null column.
+        spark_engine = spark.Engine()
+        df = pd.DataFrame(
+            {"col_0": [1, 2, 3], "col_1": ["a", "b", "c"], "event_time": [1, 2, 3]}
+        )
+        spark_df = spark_engine._spark_session.createDataFrame(df)
+        ge_suite = great_expectations.core.ExpectationSuite(
+            name="es_name",
+            expectations=[
+                ExpectationConfiguration(
+                    type="expect_column_values_to_not_be_null",
+                    kwargs={"column": "col_0"},
+                    meta={},
+                ),
+            ],
+        )
+
+        # Act
+        result = spark_engine.validate_with_great_expectations(
+            dataframe=spark_df,
+            expectation_suite=ge_suite,
+            ge_validate_kwargs={},
+        )
+
+        # Assert: 1.x ESVR shape differs structurally from 0.x (no run_id /
+        # batch_markers / active_batch_definition); pin only the stable fields
+        # that the SDK and the wire format rely on.
+        assert isinstance(
+            result, great_expectations.core.ExpectationSuiteValidationResult
+        )
+        assert result.success is True
+        assert len(result.results) == 1
+        assert result.results[0].success is True
+        # The result is what gets converted to a Hopsworks ValidationReport
+        # downstream; its expectation_config carries the legacy-shape type field
+        # by way of _normalize_expectation_config_to_legacy_shape applied at the
+        # ValidationReport.results setter (validation_report.py).
+        assert (
+            result.results[0].expectation_config.to_json_dict()["type"]
+            == "expect_column_values_to_not_be_null"
+        )
 
     def test_write_options(self):
         # Arrange

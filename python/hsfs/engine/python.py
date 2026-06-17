@@ -84,6 +84,7 @@ from hsfs.core import (
     transformation_function_engine,
 )
 from hsfs.core.constants import (
+    GE_MAJOR,
     HAS_AIOMYSQL,
     HAS_GREAT_EXPECTATIONS,
     HAS_NUMPY,
@@ -862,6 +863,18 @@ class Engine:
             dataframe = dataframe.to_pandas()
         if ge_validate_kwargs is None:
             ge_validate_kwargs = {}
+        if GE_MAJOR == 1:
+            # GE 1.x removed from_pandas; use the get_context + dataframe asset chain.
+            context = great_expectations.get_context(mode="ephemeral")
+            data_source = context.data_sources.add_pandas("hopsworks_pandas")
+            asset = data_source.add_dataframe_asset("hopsworks_asset")
+            batch_definition = asset.add_batch_definition_whole_dataframe(
+                "hopsworks_batch"
+            )
+            batch = batch_definition.get_batch(
+                batch_parameters={"dataframe": dataframe}
+            )
+            return batch.validate(expectation_suite, **ge_validate_kwargs)
         return great_expectations.from_pandas(
             dataframe, expectation_suite=expectation_suite
         ).validate(**ge_validate_kwargs)
@@ -913,9 +926,18 @@ class Engine:
                     dataframe_copy[col].dtype, pd.core.dtypes.dtypes.DatetimeTZDtype
                 ):
                     dataframe_copy[col] = dataframe_copy[col].dt.tz_convert(None)
-                elif HAS_POLARS and isinstance(dataframe_copy[col].dtype, pl.Datetime):
+                elif (
+                    HAS_POLARS
+                    and isinstance(dataframe_copy[col].dtype, pl.Datetime)
+                    and dataframe_copy[col].dtype.time_zone is not None
+                ):
+                    # cast to tz-naive Datetime; this converts the wall-clock to UTC
+                    # first, mirroring pandas' dt.tz_convert(None). Plain
+                    # dt.replace_time_zone(None) would just drop the tz and leave
+                    # the wall-clock time, silently producing different values for
+                    # non-UTC zones than the pandas branch above.
                     dataframe_copy = dataframe_copy.with_columns(
-                        pl.col(col).dt.replace_time_zone(None)
+                        pl.col(col).cast(pl.Datetime(time_zone=None))
                     )
             return dataframe_copy
         if dataframe == "spine":
@@ -994,108 +1016,6 @@ class Engine:
             f"Unsupported dataframe type for arrow conversion: {type(dataframe)}"
         )
 
-    def _check_duplicate_records(self, dataset, feature_group_instance):
-        """Check for duplicate records within primary_key, event_time and partition_key columns.
-
-        Raises FeatureStoreException if duplicates are found.
-
-        Parameters:
-        -----------
-        dataset : Union[pd.DataFrame, pl.DataFrame]
-            The dataset to check for duplicates
-        feature_group_instance : FeatureGroup
-            The feature group instance containing primary_key, event_time and partition_key
-        """
-        # Get the unique key columns to check (primary_key + event_time + partition_key)
-        key_columns = set(feature_group_instance.primary_key)
-
-        if not key_columns:
-            # No keys to check, skip validation
-            return
-
-        if feature_group_instance.event_time:
-            key_columns.add(feature_group_instance.event_time)
-
-        if feature_group_instance.partition_key:
-            key_columns.update(feature_group_instance.partition_key)
-
-        # Materialize as a sorted list so downstream .select()/.group_by() get a
-        # deterministic, ordered sequence instead of a set.
-        key_columns = sorted(key_columns)
-
-        # Verify all key columns exist against the original dataframe — no conversion needed.
-        if isinstance(dataset, pd.DataFrame) or (
-            HAS_POLARS and isinstance(dataset, pl.DataFrame)
-        ):
-            available_columns = list(dataset.columns)
-        else:
-            available_columns = list(self._to_arrow_table(dataset).column_names)
-
-        missing_columns = [col for col in key_columns if col not in available_columns]
-        if missing_columns:
-            raise FeatureStoreException(
-                f"Key columns {missing_columns} are missing from the dataset. "
-                f"Available columns: {available_columns}"
-            )
-
-        import pyarrow as pa
-        import pyarrow.compute as pc
-
-        # Convert only the key columns to Arrow — avoids transcoding all feature columns
-        # (including costly numpy-U → UTF-8 re-encoding) for a check that only needs keys.
-        if isinstance(dataset, pd.DataFrame):
-            key_table = pa.Table.from_pandas(dataset[key_columns], preserve_index=False)
-        elif HAS_POLARS and isinstance(dataset, pl.DataFrame):
-            key_table = dataset.select(key_columns).to_arrow()
-        else:
-            key_table = self._to_arrow_table(dataset).select(key_columns)
-
-        # Check for duplicates using PyArrow group_by
-        # Group by key columns and count occurrences
-        grouped = key_table.group_by(key_columns).aggregate(
-            [
-                # The aggregation tuple structure: ([], function_name, FunctionOptions)
-                ([], "count_all", pc.CountOptions(mode="all"))
-            ]
-        )
-
-        # Filter groups with count > 1 (duplicates)
-        duplicate_groups = grouped.filter(pc.greater(grouped["count_all"], 1))
-
-        duplicate_count = len(duplicate_groups)
-
-        if duplicate_count > 0:
-            # Get total number of duplicate rows (sum of counts - 1 for each duplicate group)
-            # Since count includes the first occurrence, duplicates = count - 1 per group
-            total_duplicate_rows = (
-                sum(duplicate_groups["count_all"].to_pylist()) - duplicate_count
-            )
-
-            # Get sample duplicate records for error message
-            # Take first 10 duplicate groups and get their key values
-            sample_groups = duplicate_groups.slice(0, min(10, duplicate_count))
-
-            # Build sample string showing the duplicate key combinations
-            sample_rows = []
-            for i in range(len(sample_groups)):
-                row_dict = {}
-                for col in key_columns:
-                    row_dict[col] = sample_groups[col][i].as_py()
-                row_dict["count_all"] = sample_groups["count_all"][i].as_py()
-                sample_rows.append(str(row_dict))
-
-            sample_str = "\n".join(sample_rows)
-
-            raise FeatureStoreException(
-                FeatureStoreException.DUPLICATE_RECORD_ERROR_MESSAGE
-                + f"\nDataset contains {total_duplicate_rows} duplicate record(s) within "
-                f"primary_key ({feature_group_instance.primary_key}), "
-                f"event_time ({feature_group_instance.event_time}) and "
-                f"partition_key ({feature_group_instance.partition_key}). "
-                f"Found {duplicate_count} duplicate group(s). "
-                f"Sample duplicate key combinations:\n{sample_str}"
-            )
-
     def _mark_online_rows(
         self,
         feature_group: FeatureGroup,
@@ -1120,9 +1040,14 @@ class Engine:
                     threshold = datetime.now(tz=timezone.utc) - timedelta(
                         seconds=feature_group.ttl
                     )
+                    # cast (rather than dt.replace_time_zone("UTC")) so that
+                    # tz-aware columns convert to the UTC instant; replace_time_zone
+                    # only relabels and would silently misclassify rows from non-UTC
+                    # zones. Naive datetimes are interpreted as UTC, mirroring the
+                    # pandas branch's pd.to_datetime(..., utc=True).
                     return (
                         dataframe[event_time]
-                        .dt.replace_time_zone("UTC")
+                        .cast(pl.Datetime(time_zone="UTC"))
                         .gt(threshold)
                         .to_list()
                     )
@@ -1163,15 +1088,6 @@ class Engine:
         online_write_options: dict[str, Any],
         validation_id: int | None = None,
     ) -> job.Job | None:
-        if (
-            # Only `FeatureGroup` class has time_travel_format property
-            isinstance(feature_group, FeatureGroup)
-            and feature_group.time_travel_format == "DELTA"
-            and storage in [None, "offline"]
-        ):
-            self._check_duplicate_records(dataframe, feature_group)
-            _logger.debug("No duplicate records found. Proceeding with Delta write.")
-
         if (
             not isinstance(feature_group, fg_mod.ExternalFeatureGroup)
             and feature_group.stream
@@ -1327,7 +1243,12 @@ class Engine:
     ) -> tuple[pd.DataFrame | pl.DataFrame, pd.DataFrame | pl.DataFrame | None]:
         if labels:
             labels_df = df[labels]
-            df_new = df.drop(columns=labels)
+            if HAS_POLARS and isinstance(
+                df, (pl.DataFrame, pl.dataframe.frame.DataFrame)
+            ):
+                df_new = df.drop(labels)
+            else:
+                df_new = df.drop(columns=labels)
             return (
                 self._return_dataframe_type(df_new, dataframe_type),
                 self._return_dataframe_type(labels_df, dataframe_type),

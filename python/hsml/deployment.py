@@ -18,9 +18,9 @@ from typing import TYPE_CHECKING
 
 from hopsworks_apigen import public
 from hopsworks_common import client, usage, util
+from hopsworks_common.client.exceptions import ModelServingException
 from hopsworks_common.core import tags_api
 from hsml import predictor as predictor_mod
-from hsml.client.exceptions import ModelServingException
 from hsml.constants import DEPLOYABLE_COMPONENT, PREDICTOR_STATE
 from hsml.core import model_api, serving_api
 from hsml.engine import serving_engine
@@ -121,6 +121,28 @@ class Deployment:
             hopsworks.client.exceptions.RestAPIError: In case the backend encounters an issue.
         """
         self._serving_engine.stop(self, await_status=await_stopped)
+
+    @public
+    @usage.method_logger
+    def restart(
+        self,
+        await_stopped: int | None = 600,
+        await_running: int | None = 600,
+    ) -> None:
+        """Restart the deployment so it picks up the latest code and environment state.
+
+        If the deployment is already stopped, it is started in place.
+
+        Parameters:
+            await_stopped: Awaiting time (seconds) for the deployment to stop.
+            await_running: Awaiting time (seconds) for the deployment to start again.
+
+        Raises:
+            hopsworks.client.exceptions.RestAPIError: In case the backend encounters an issue.
+        """
+        if not self.is_stopped():
+            self.stop(await_stopped=await_stopped)
+        self.start(await_running=await_running)
 
     @public
     @usage.method_logger
