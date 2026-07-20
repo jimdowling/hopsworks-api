@@ -336,7 +336,7 @@
 | python/hsfs/core/training\_dataset\_job\_conf.py                                 |       37 |       14 |     62% |25-28, 32, 36, 40, 44, 48, 52, 56, 60, 63, 66 |
 | python/hsfs/core/transformation\_execution\_dag.py                               |      179 |       25 |     86% |78, 200, 209-220, 262, 327-328, 346-360 |
 | python/hsfs/core/transformation\_function\_api.py                                |       26 |       16 |     38% |42-51, 80-95, 108-118 |
-| python/hsfs/core/transformation\_function\_engine.py                             |      506 |       89 |     82% |215-216, 224-228, 252, 283-287, 309, 314-327, 361-363, 384, 398, 789, 829-830, 839, 844-849, 856-862, 894, 896, 951-971, 984-1000, 1043-1053, 1108, 1203-1236, 1285-1292, 1403, 1515-1520, 1571, 1628-1633, 1666 |
+| python/hsfs/core/transformation\_function\_engine.py                             |      506 |       87 |     83% |215-216, 224-228, 252, 283-287, 309, 314-327, 361-363, 384, 398, 789, 829-830, 839, 844-849, 856-862, 951-971, 984-1000, 1043-1053, 1108, 1203-1236, 1285-1292, 1403, 1515-1520, 1571, 1628-1633, 1666 |
 | python/hsfs/core/type\_systems.py                                                |        2 |        0 |    100% |           |
 | python/hsfs/core/util\_sql.py                                                    |       38 |       21 |     45% |37-74, 91-106 |
 | python/hsfs/core/validation\_report\_api.py                                      |       34 |       21 |     38% |44-65, 75-87, 95-113, 123-140 |
@@ -467,7 +467,7 @@
 | python/hsml/utils/schema/tensor.py                                               |        8 |        0 |    100% |           |
 | python/hsml/utils/schema/tensor\_schema.py                                       |       34 |        0 |    100% |           |
 | python/hsml/version.py                                                           |        2 |        2 |      0% |     17-22 |
-| **TOTAL**                                                                        | **40929** | **12515** | **69%** |           |
+| **TOTAL**                                                                        | **40929** | **12513** | **69%** |           |
 
 
 ## Setup coverage badge
