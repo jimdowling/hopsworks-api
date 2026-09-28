@@ -21,7 +21,7 @@ nothing about MySQL: the numbers here are scheduling behaviour, not cluster
 latency. Two things are counted that do not depend on the simulation at all,
 and those are the point of the benchmark:
 
-* how many liveness round trips a run of N reads performs, and
+* how many liveness round trips a run of N reads performs, counting both the checks before reads and the pool being opened, which is itself a check, and
 * how many reads are ever in flight together.
 
 Run it on two revisions and compare:
@@ -57,6 +57,7 @@ class _Counters:
 
     def __init__(self):
         self.pings = 0
+        self.pool_opens = 0
         self.in_flight = 0
         self.peak_in_flight = 0
         self._lock = threading.Lock()
@@ -78,8 +79,25 @@ class _Counters:
         return 1
 
 
-async def _pool(*_args):
-    return object()
+class _FakePool:
+    """Stands in for the aiomysql pool, which shutdown closes on the thread's loop."""
+
+    def close(self) -> None:
+        pass
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+def _pool_opener(counters: _Counters):
+    """A pool initializer that counts itself: opening the pool reaches the database too."""
+
+    async def open_pool(*_args):
+        with counters._lock:
+            counters.pool_opens += 1
+        return _FakePool()
+
+    return open_pool
 
 
 _RETRY_FLAG_SUPPORTED = (
@@ -104,7 +122,8 @@ def measure(callers: int, reads_per_caller: int) -> dict:
     """Drive `callers` threads through one shared dispatcher, as a serving process does."""
     counters = _Counters()
     thread = AsyncTaskThread(
-        connection_pool_initializer=_pool, connection_test=counters.ping
+        connection_pool_initializer=_pool_opener(counters),
+        connection_test=counters.ping,
     )
     thread.start()
     start_together = threading.Barrier(callers)
@@ -139,7 +158,9 @@ def measure(callers: int, reads_per_caller: int) -> dict:
             "p95": round(ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))], 2),
             "max": round(ordered[-1], 2),
         },
-        "liveness_round_trips": counters.pings,
+        "liveness_round_trips": counters.pings + counters.pool_opens,
+        "pings_before_reads": counters.pings,
+        "pool_opens": counters.pool_opens,
         "peak_reads_in_flight": counters.peak_in_flight,
         "simulated_ping_ms": PING_SECONDS * 1000,
         "simulated_query_ms": QUERY_SECONDS * 1000,
